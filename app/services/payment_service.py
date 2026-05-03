@@ -23,7 +23,7 @@ from typing import Optional
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select, func
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
@@ -36,7 +36,9 @@ from app.models.ledger import (
     Fee, InterestAccrual, JournalEntry, JournalLine, LedgerAccount, Payment
 )
 from app.models.loan import Loan
+from app.models.portfolio import LoanAllocation, Portfolio
 from app.schemas.payment import PaymentCreate
+from app.services.loan_allocation_service import LoanAllocationService
 
 logger = structlog.get_logger(__name__)
 
@@ -51,6 +53,7 @@ WATERFALL = [
     "principal",
     "escrow",
     "advances",
+    "penalty",  # only used for payoff payments — recognized as income, not a receivable
 ]
 
 # ---------------------------------------------------------------------------
@@ -108,18 +111,25 @@ class PaymentService:
     # Core: post a payment
     # -------------------------------------------------------------------------
 
-    async def post_payment(self, payload: PaymentCreate, posted_by: UUID) -> Payment:
+    async def post_payment(
+        self,
+        payload: PaymentCreate,
+        posted_by: UUID,
+        prepayment_penalty: Decimal = Decimal("0"),
+    ) -> Payment:
         # 1. Load the loan
         loan = await self._get_payable_loan(payload.loan_id)
 
         # 2. Calculate days late
         days_late, late_fee = await self._assess_late_fee(loan, payload)
 
-        # 3. Apply waterfall
+        # 3. Apply waterfall (penalty bucket populated only when caller passes it
+        # — typically payoff_service for payment_type='payoff').
         waterfall = self._apply_waterfall(
             gross_amount=payload.gross_amount,
             loan=loan,
             late_fee=late_fee,
+            prepayment_penalty=prepayment_penalty,
         )
 
         # 4. Build payment record
@@ -137,6 +147,7 @@ class PaymentService:
             applied_to_principal=waterfall["principal"],
             applied_to_escrow=waterfall["escrow"],
             applied_to_advances=waterfall["advances"],
+            applied_to_penalty=waterfall["penalty"],
             held_in_suspense=waterfall["suspense"],
             period_id=payload.period_id,
             reference_number=payload.reference_number,
@@ -207,25 +218,37 @@ class PaymentService:
 
         loan = await self._get_payable_loan(original.loan_id)
 
-        # Create reversing journal entry
-        original_je = await self.db.get(JournalEntry, original.journal_entry_id)
-        if not original_je:
-            raise PaymentPostingError("Cannot reverse payment: original journal entry not found")
-
-        reversal_je = await self._create_reversal_journal_entry(
-            original_entry=original_je,
-            loan=loan,
-            reason=reason,
-            reversed_by=reversed_by,
+        # Phase 4: a payment may have N journal entries (one per allocation).
+        # Reverse all of them by walking reference_id, not the single
+        # payment.journal_entry_id pointer.
+        original_entries_result = await self.db.execute(
+            select(JournalEntry).where(
+                JournalEntry.reference_id == original.id,
+                JournalEntry.reference_type == "payment",
+                JournalEntry.is_reversed == False,
+            )
         )
+        original_entries = list(original_entries_result.scalars().all())
+        if not original_entries:
+            raise PaymentPostingError(
+                "Cannot reverse payment: no posted journal entries linked to it."
+            )
 
-        # Mark original as reversed
+        for original_je in original_entries:
+            reversal_je = await self._create_reversal_journal_entry(
+                original_entry=original_je,
+                loan=loan,
+                reason=reason,
+                reversed_by=reversed_by,
+            )
+            original_je.is_reversed = True
+            original_je.reversed_by_entry_id = reversal_je.id
+            original_je.status = "reversed"
+
         original.status = "reversed"
-        original_je.is_reversed = True
-        original_je.reversed_by_entry_id = reversal_je.id
-        original_je.status = "reversed"
 
-        # Undo loan balance changes
+        # Undo loan balance changes. Penalty has no loan-level state to undo
+        # (it's recognized as income at posting), so we don't include it here.
         reverse_waterfall = {
             "fees": -original.applied_to_fees,
             "interest": -original.applied_to_interest,
@@ -256,6 +279,7 @@ class PaymentService:
         gross_amount: Decimal,
         loan: Loan,
         late_fee: Decimal,
+        prepayment_penalty: Decimal = Decimal("0"),
     ) -> dict[str, Decimal]:
         """
         Apply payment to loan components in waterfall order.
@@ -267,10 +291,18 @@ class PaymentService:
           3. Principal
           4. Escrow
           5. Advances
-          6. Remainder → suspense
+          6. Prepayment penalty (only when caller passes one — payoff path)
+          7. Remainder → suspense
+
+        `prepayment_penalty` is the loan's contractual penalty due on early
+        payoff. It's not a receivable being cleared — it's income recognized
+        when collected, so it has its own bucket and journal account (4040).
         """
         remaining = gross_amount
-        result = {k: Decimal("0") for k in ["fees", "interest", "principal", "escrow", "advances", "suspense"]}
+        result = {
+            k: Decimal("0")
+            for k in ["fees", "interest", "principal", "escrow", "advances", "penalty", "suspense"]
+        }
 
         # Fees outstanding (existing accrued fees + new late fee)
         fees_due = (loan.accrued_fees + late_fee).quantize(CENTS)
@@ -287,14 +319,17 @@ class PaymentService:
             result["principal"] = min(remaining, loan.current_principal.quantize(CENTS))
             remaining -= result["principal"]
 
-        # Escrow (placeholder — escrow balance loaded separately in full impl)
-        # For MVP, any remaining after principal goes to suspense
+        # Escrow / advances (placeholders — not modelled in MVP)
         result["escrow"] = Decimal("0")
-
-        # Advances
         result["advances"] = Decimal("0")
 
-        # Suspense: any amount that couldn't be applied
+        # Prepayment penalty (only on payoff). Cap at remaining so a short-paid
+        # payoff doesn't over-recognize income.
+        if remaining > 0 and prepayment_penalty > 0:
+            result["penalty"] = min(remaining, prepayment_penalty.quantize(CENTS))
+            remaining -= result["penalty"]
+
+        # Suspense: anything left over
         result["suspense"] = remaining.quantize(CENTS)
 
         # Sanity check: allocations must sum to gross
@@ -372,111 +407,204 @@ class PaymentService:
         posted_by: UUID,
     ) -> JournalEntry:
         """
-        Create a balanced double-entry journal entry for the payment.
+        Phase 4: write-time GL split.
 
-        Standard payment entries:
-          DR  Cash - Operating                (gross_amount)
-          CR  Accrued Interest Receivable     (interest portion)
-          CR  Loans Receivable - Principal    (principal portion)
-          CR  Fees Receivable                 (fees portion)
-          CR  Cash - Suspense                 (suspense portion, if any)
+        Creates one JournalEntry per active allocation (as-of payment.effective_date),
+        with each waterfall bucket pro-rated by ownership_pct using largest-remainder
+        so per-bucket cents reconcile exactly across funds. Per-fund DR(cash) =
+        sum of that fund's per-bucket credits, so each entry balances individually.
+
+        Returns the highest-share entry (allocations are sorted by ownership_pct desc),
+        so the caller's existing `payment.journal_entry_id = entry.id` assignment
+        still gives a meaningful single-entry pointer for non-syndicated loans.
+        Reversals find ALL entries via reference_id = payment.id, so the multi-entry
+        case is handled correctly.
+
+        Standard line shape per entry (zero-amount lines are skipped):
+          DR  Cash - Operating                (per-fund cash share)
+          CR  Accrued Interest Receivable     (per-fund interest share)
+          CR  Loans Receivable - Principal    (per-fund principal share)
+          CR  Fees Receivable                 (per-fund fees share)
+          CR  Suspense Liability              (per-fund suspense share)
         """
         accounts = await self._load_account_map()
-        entry_number = await self._generate_entry_number()
 
-        now = datetime.now(timezone.utc)
-        entry = JournalEntry(
-            entry_number=entry_number,
-            loan_id=loan.id,
-            portfolio_id=loan.portfolio_id,
-            entry_type="payment",
-            entry_date=now.date(),
-            effective_date=payment.effective_date,
-            description=f"Payment posted: {payment.payment_number} | {payment.payment_method.upper()}",
-            reference_id=payment.id,
-            reference_type="payment",
-            status="posted",
-            posted_by=posted_by,
-            created_at=now,
+        # Active allocations as-of the payment's effective_date. Sorted by pct desc
+        # so the largest fund gets the lowest line numbers and is returned first.
+        alloc_result = await self.db.execute(
+            select(LoanAllocation).where(
+                LoanAllocation.loan_id == loan.id,
+                LoanAllocation.effective_date <= payment.effective_date,
+                or_(
+                    LoanAllocation.end_date.is_(None),
+                    LoanAllocation.end_date > payment.effective_date,
+                ),
+            ).order_by(LoanAllocation.ownership_pct.desc())
         )
-        self.db.add(entry)
-        await self.db.flush()
-
-        lines = []
-        line_num = 1
-
-        # DR Cash (gross amount in)
-        lines.append(JournalLine(
-            journal_entry_id=entry.id,
-            line_number=line_num,
-            account_id=accounts["1010"],  # Cash - Operating
-            debit_amount=payment.gross_amount,
-            credit_amount=Decimal("0"),
-            memo=f"Payment received: {payment.reference_number or payment.payment_number}",
-        ))
-        line_num += 1
-
-        # CR Interest income / receivable
-        if waterfall["interest"] > 0:
-            lines.append(JournalLine(
-                journal_entry_id=entry.id,
-                line_number=line_num,
-                account_id=accounts["1110"],  # Accrued Interest Receivable
-                debit_amount=Decimal("0"),
-                credit_amount=waterfall["interest"],
-                memo="Interest collected",
-            ))
-            line_num += 1
-
-        # CR Principal
-        if waterfall["principal"] > 0:
-            lines.append(JournalLine(
-                journal_entry_id=entry.id,
-                line_number=line_num,
-                account_id=accounts["1100"],  # Loans Receivable - Principal
-                debit_amount=Decimal("0"),
-                credit_amount=waterfall["principal"],
-                memo="Principal repayment",
-            ))
-            line_num += 1
-
-        # CR Fees
-        if waterfall["fees"] > 0:
-            lines.append(JournalLine(
-                journal_entry_id=entry.id,
-                line_number=line_num,
-                account_id=accounts["1120"],  # Fees Receivable
-                debit_amount=Decimal("0"),
-                credit_amount=waterfall["fees"],
-                memo="Fees collected",
-            ))
-            line_num += 1
-
-        # CR Suspense (unapplied cash)
-        if waterfall["suspense"] > 0:
-            lines.append(JournalLine(
-                journal_entry_id=entry.id,
-                line_number=line_num,
-                account_id=accounts["2030"],  # Suspense Liability
-                debit_amount=Decimal("0"),
-                credit_amount=waterfall["suspense"],
-                memo="Unapplied cash to suspense",
-            ))
-            line_num += 1
-
-        # Validate balance
-        total_debits = sum(l.debit_amount for l in lines)
-        total_credits = sum(l.credit_amount for l in lines)
-        if total_debits != total_credits:
+        allocations = list(alloc_result.scalars().all())
+        if not allocations:
             raise LedgerImbalanceError(
-                f"Journal entry imbalance: debits={total_debits}, credits={total_credits}"
+                f"Loan {loan.loan_number} has no active allocation "
+                f"as-of {payment.effective_date}; cannot post payment."
             )
 
-        for line in lines:
-            self.db.add(line)
+        # Pre-fetch portfolio codes for entry_number suffixes
+        port_result = await self.db.execute(
+            select(Portfolio.id, Portfolio.code).where(
+                Portfolio.id.in_([a.portfolio_id for a in allocations])
+            )
+        )
+        portfolio_codes = {row.id: row.code for row in port_result}
+
+        alloc_pcts = [(a.portfolio_id, a.ownership_pct) for a in allocations]
+
+        # Split each waterfall bucket independently. Each bucket's cents
+        # reconcile exactly across funds via largest-remainder.
+        bucket_splits: dict[str, list[tuple[UUID, int]]] = {}
+        for bucket in ("fees", "interest", "principal", "escrow", "advances", "penalty", "suspense"):
+            bucket_cents = int(
+                (waterfall[bucket] * 100).to_integral_value(rounding=ROUND_HALF_UP)
+            )
+            bucket_splits[bucket] = LoanAllocationService.split_with_largest_remainder(
+                bucket_cents, alloc_pcts
+            )
+
+        base_entry_number = await self._generate_entry_number()
+        now = datetime.now(timezone.utc)
+        entries_created: list[JournalEntry] = []
+
+        for i, alloc in enumerate(allocations):
+            fees_c      = bucket_splits["fees"][i][1]
+            interest_c  = bucket_splits["interest"][i][1]
+            principal_c = bucket_splits["principal"][i][1]
+            escrow_c    = bucket_splits["escrow"][i][1]
+            advances_c  = bucket_splits["advances"][i][1]
+            penalty_c   = bucket_splits["penalty"][i][1]
+            suspense_c  = bucket_splits["suspense"][i][1]
+            cash_c = fees_c + interest_c + principal_c + escrow_c + advances_c + penalty_c + suspense_c
+            if cash_c == 0:
+                # Tiny payment + small allocation can round to zero everywhere.
+                # Skip the empty entry rather than write zero-amount lines.
+                continue
+
+            portfolio_code = portfolio_codes.get(alloc.portfolio_id, str(alloc.portfolio_id)[:8])
+            pct_str = f"{alloc.ownership_pct}% to {portfolio_code}"
+
+            entry = JournalEntry(
+                entry_number=f"{base_entry_number}-{portfolio_code}",
+                loan_id=loan.id,
+                portfolio_id=alloc.portfolio_id,
+                entry_type="payment",
+                entry_date=now.date(),
+                effective_date=payment.effective_date,
+                description=(
+                    f"Payment posted: {payment.payment_number} | "
+                    f"{payment.payment_method.upper()} ({pct_str})"
+                ),
+                reference_id=payment.id,
+                reference_type="payment",
+                status="posted",
+                posted_by=posted_by,
+                created_at=now,
+            )
+            self.db.add(entry)
+            await self.db.flush()  # need entry.id for lines
+
+            lines: list[JournalLine] = []
+            line_num = 1
+
+            lines.append(JournalLine(
+                journal_entry_id=entry.id,
+                line_number=line_num,
+                account_id=accounts["1010"],  # Cash - Operating
+                debit_amount=Decimal(cash_c) / 100,
+                credit_amount=Decimal("0"),
+                memo=(
+                    f"Payment received ({pct_str}): "
+                    f"{payment.reference_number or payment.payment_number}"
+                ),
+            ))
+            line_num += 1
+
+            if interest_c > 0:
+                lines.append(JournalLine(
+                    journal_entry_id=entry.id,
+                    line_number=line_num,
+                    account_id=accounts["1110"],
+                    debit_amount=Decimal("0"),
+                    credit_amount=Decimal(interest_c) / 100,
+                    memo=f"Interest collected ({pct_str})",
+                ))
+                line_num += 1
+
+            if principal_c > 0:
+                lines.append(JournalLine(
+                    journal_entry_id=entry.id,
+                    line_number=line_num,
+                    account_id=accounts["1100"],
+                    debit_amount=Decimal("0"),
+                    credit_amount=Decimal(principal_c) / 100,
+                    memo=f"Principal repayment ({pct_str})",
+                ))
+                line_num += 1
+
+            if fees_c > 0:
+                lines.append(JournalLine(
+                    journal_entry_id=entry.id,
+                    line_number=line_num,
+                    account_id=accounts["1120"],
+                    debit_amount=Decimal("0"),
+                    credit_amount=Decimal(fees_c) / 100,
+                    memo=f"Fees collected ({pct_str})",
+                ))
+                line_num += 1
+
+            if suspense_c > 0:
+                lines.append(JournalLine(
+                    journal_entry_id=entry.id,
+                    line_number=line_num,
+                    account_id=accounts["2030"],
+                    debit_amount=Decimal("0"),
+                    credit_amount=Decimal(suspense_c) / 100,
+                    memo=f"Unapplied cash to suspense ({pct_str})",
+                ))
+                line_num += 1
+
+            if penalty_c > 0:
+                lines.append(JournalLine(
+                    journal_entry_id=entry.id,
+                    line_number=line_num,
+                    account_id=accounts["4040"],  # Prepayment Penalty Income
+                    debit_amount=Decimal("0"),
+                    credit_amount=Decimal(penalty_c) / 100,
+                    memo=f"Prepayment penalty income ({pct_str})",
+                ))
+                line_num += 1
+
+            # Per-entry balance check (largest-remainder guarantees this, but verify).
+            total_debits = sum((l.debit_amount for l in lines), Decimal("0"))
+            total_credits = sum((l.credit_amount for l in lines), Decimal("0"))
+            if total_debits != total_credits:
+                raise LedgerImbalanceError(
+                    f"Per-fund journal entry imbalance for {portfolio_code}: "
+                    f"debits={total_debits}, credits={total_credits}"
+                )
+
+            for line in lines:
+                self.db.add(line)
+
+            entries_created.append(entry)
 
         await self.db.flush()
-        return entry
+
+        if not entries_created:
+            # Should not happen — gross_amount > 0 means at least one fund
+            # gets non-zero cents from largest-remainder.
+            raise LedgerImbalanceError(
+                f"No journal entries created for payment {payment.payment_number}"
+            )
+
+        return entries_created[0]
 
     async def _create_reversal_journal_entry(
         self,
@@ -504,7 +632,9 @@ class PaymentService:
         reversal = JournalEntry(
             entry_number=entry_number,
             loan_id=loan.id,
-            portfolio_id=loan.portfolio_id,
+            # Reversal lands in the SAME fund's books as the original entry,
+            # not the lead-fund pointer on the loan.
+            portfolio_id=original_entry.portfolio_id,
             entry_type="reversal",
             entry_date=now.date(),
             effective_date=now.date(),

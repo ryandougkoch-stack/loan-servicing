@@ -18,11 +18,13 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 import structlog
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from app.db.session import get_tenant_session_context
 from app.models.ledger import InterestAccrual, JournalEntry, JournalLine, LedgerAccount
 from app.models.loan import Loan
+from app.models.portfolio import LoanAllocation, Portfolio
+from app.services.loan_allocation_service import LoanAllocationService
 from app.workers.celery_app import celery_app
 
 logger = structlog.get_logger(__name__)
@@ -101,13 +103,17 @@ async def _run_accrual(tenant_slug: str, accrual_date: date) -> None:
         )
         accounts = {row.code: row.id for row in acct_result}
 
+        # Pre-fetch portfolio codes for entry_number suffix uniqueness
+        port_result = await session.execute(select(Portfolio.id, Portfolio.code))
+        portfolio_codes = {row.id: row.code for row in port_result}
+
         skipped = 0
         processed = 0
         errors = 0
 
         for loan in loans:
             try:
-                accrued = await _accrue_loan(session, loan, accrual_date, accounts)
+                accrued = await _accrue_loan(session, loan, accrual_date, accounts, portfolio_codes)
                 if accrued:
                     processed += 1
                 else:
@@ -136,12 +142,20 @@ async def _accrue_loan(
     loan: Loan,
     accrual_date: date,
     accounts: dict,
+    portfolio_codes: dict,
 ) -> bool:
     """
     Accrue one day's interest for a single loan.
-    Returns True if accrual was created, False if skipped (already exists).
+
+    Phase 3: write-time GL split. One InterestAccrual row (loan-level economics);
+    one JournalEntry per active allocation, with DR/CR amounts pro-rated by
+    ownership_pct. Cents balanced via largest-remainder so per-fund slices sum
+    to the full daily accrual exactly.
+
+    Returns True if accrual was created, False if skipped (already exists or
+    no rate/no allocation).
     """
-    # Idempotency check
+    # Idempotency check (loan-level — one accrual record per loan-day)
     existing = await session.execute(
         select(InterestAccrual).where(
             InterestAccrual.loan_id == loan.id,
@@ -150,82 +164,59 @@ async def _accrue_loan(
         )
     )
     if existing.scalar_one_or_none():
-        return False  # Already accrued for this date
+        return False
 
-    # Determine effective rate
     effective_rate = _get_effective_rate(loan, accrual_date)
     if effective_rate is None or effective_rate <= 0:
         return False
 
-    # Calculate daily rate and accrual amount
     denominator = _get_day_count_denominator(loan.day_count, accrual_date)
     daily_rate = (effective_rate / denominator).quantize(TEN_PLACES)
     accrued_amount = (loan.current_principal * daily_rate).quantize(CENTS, rounding=ROUND_HALF_UP)
 
-    # PIK: capitalise into principal
     pik_amount = Decimal("0")
     if loan.pik_rate and loan.pik_rate > 0:
         pik_daily = (loan.pik_rate / denominator).quantize(TEN_PLACES)
         pik_amount = (loan.current_principal * pik_daily).quantize(CENTS, rounding=ROUND_HALF_UP)
 
+    # Active allocations as-of accrual_date. Ordered by pct desc so the largest
+    # share gets the lowest line numbers — purely cosmetic, but deterministic.
+    alloc_result = await session.execute(
+        select(LoanAllocation).where(
+            LoanAllocation.loan_id == loan.id,
+            LoanAllocation.effective_date <= accrual_date,
+            or_(
+                LoanAllocation.end_date.is_(None),
+                LoanAllocation.end_date > accrual_date,
+            ),
+        ).order_by(LoanAllocation.ownership_pct.desc())
+    )
+    allocations = list(alloc_result.scalars().all())
+    if not allocations:
+        # Should never happen — every loan gets a 100% allocation at boarding.
+        # Surface loudly rather than silently skip.
+        logger.error(
+            "loan_has_no_active_allocation",
+            loan_id=str(loan.id),
+            loan_number=loan.loan_number,
+            accrual_date=accrual_date.isoformat(),
+        )
+        return False
+
+    # Split the accrued + PIK amounts (in cents) across allocations.
+    alloc_pcts = [(a.portfolio_id, a.ownership_pct) for a in allocations]
+    accrued_cents = int((accrued_amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    pik_cents = int((pik_amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    accrued_split = LoanAllocationService.split_with_largest_remainder(accrued_cents, alloc_pcts)
+    pik_split = (
+        LoanAllocationService.split_with_largest_remainder(pik_cents, alloc_pcts)
+        if pik_cents > 0
+        else [(pid, 0) for pid, _ in alloc_pcts]
+    )
+
     now = datetime.now(timezone.utc)
 
-    # Create journal entry
-    entry_number = f"ACC-{accrual_date.strftime('%Y%m%d')}-{str(loan.id)[:8]}"
-    entry = JournalEntry(
-        entry_number=entry_number,
-        loan_id=loan.id,
-        portfolio_id=loan.portfolio_id,
-        entry_type="accrual",
-        entry_date=accrual_date,
-        effective_date=accrual_date,
-        description=f"Daily interest accrual — {loan.loan_number}",
-        status="posted",
-        posted_by=_system_user_id(),
-        created_at=now,
-    )
-    session.add(entry)
-    await session.flush()
-
-    # DR Accrued Interest Receivable
-    session.add(JournalLine(
-        journal_entry_id=entry.id,
-        line_number=1,
-        account_id=accounts["1110"],
-        debit_amount=accrued_amount,
-        credit_amount=Decimal("0"),
-        memo=f"Daily accrual @ {float(effective_rate):.4%}",
-    ))
-    # CR Interest Income
-    session.add(JournalLine(
-        journal_entry_id=entry.id,
-        line_number=2,
-        account_id=accounts["4010"],
-        debit_amount=Decimal("0"),
-        credit_amount=accrued_amount,
-        memo=f"Interest income — {loan.loan_number}",
-    ))
-
-    # If PIK: additionally DR Loans Receivable / CR Interest Income
-    if pik_amount > 0:
-        session.add(JournalLine(
-            journal_entry_id=entry.id,
-            line_number=3,
-            account_id=accounts["1100"],  # Loans Receivable - Principal
-            debit_amount=pik_amount,
-            credit_amount=Decimal("0"),
-            memo="PIK interest capitalised to principal",
-        ))
-        session.add(JournalLine(
-            journal_entry_id=entry.id,
-            line_number=4,
-            account_id=accounts["4010"],
-            debit_amount=Decimal("0"),
-            credit_amount=pik_amount,
-            memo="PIK interest income",
-        ))
-
-    # Create accrual record
+    # Create the InterestAccrual record first so journal entries can reference it.
     accrual = InterestAccrual(
         loan_id=loan.id,
         accrual_date=accrual_date,
@@ -235,15 +226,101 @@ async def _accrue_loan(
         pik_amount=pik_amount,
         day_count_used=loan.day_count,
         rate_snapshot=effective_rate,
-        journal_entry_id=entry.id,
+        journal_entry_id=None,  # set below if there's exactly one entry
         created_at=now,
     )
     session.add(accrual)
+    await session.flush()  # need accrual.id
 
-    # Update loan balances
+    # One JournalEntry per allocation. Each fund's books stay independently correct
+    # — Investran exports per portfolio_id and gets accurate sub-ledger.
+    entries_created: list[JournalEntry] = []
+    date_str = accrual_date.strftime("%Y%m%d")
+    loan_prefix = str(loan.id)[:8]
+
+    for alloc, (_, accrued_share_cents), (_, pik_share_cents) in zip(
+        allocations, accrued_split, pik_split
+    ):
+        # Rounding can leave a fund with $0 of both. Don't write empty entries.
+        if accrued_share_cents == 0 and pik_share_cents == 0:
+            continue
+
+        accrued_share = Decimal(accrued_share_cents) / 100
+        pik_share = Decimal(pik_share_cents) / 100
+        portfolio_code = portfolio_codes.get(alloc.portfolio_id, str(alloc.portfolio_id)[:8])
+
+        entry = JournalEntry(
+            entry_number=f"ACC-{date_str}-{loan_prefix}-{portfolio_code}",
+            loan_id=loan.id,
+            portfolio_id=alloc.portfolio_id,
+            entry_type="accrual",
+            entry_date=accrual_date,
+            effective_date=accrual_date,
+            description=(
+                f"Daily interest accrual — {loan.loan_number} "
+                f"({alloc.ownership_pct}% to {portfolio_code})"
+            ),
+            reference_id=accrual.id,
+            reference_type="interest_accrual",
+            status="posted",
+            posted_by=_system_user_id(),
+            created_at=now,
+        )
+        session.add(entry)
+        await session.flush()  # need entry.id
+
+        line_no = 0
+        if accrued_share > 0:
+            line_no += 1
+            session.add(JournalLine(
+                journal_entry_id=entry.id,
+                line_number=line_no,
+                account_id=accounts["1110"],
+                debit_amount=accrued_share,
+                credit_amount=Decimal("0"),
+                memo=f"Daily accrual @ {float(effective_rate):.4%} — {alloc.ownership_pct}% share",
+            ))
+            line_no += 1
+            session.add(JournalLine(
+                journal_entry_id=entry.id,
+                line_number=line_no,
+                account_id=accounts["4010"],
+                debit_amount=Decimal("0"),
+                credit_amount=accrued_share,
+                memo=f"Interest income — {loan.loan_number} ({alloc.ownership_pct}% share)",
+            ))
+
+        if pik_share > 0:
+            line_no += 1
+            session.add(JournalLine(
+                journal_entry_id=entry.id,
+                line_number=line_no,
+                account_id=accounts["1100"],
+                debit_amount=pik_share,
+                credit_amount=Decimal("0"),
+                memo=f"PIK interest capitalised — {alloc.ownership_pct}% share",
+            ))
+            line_no += 1
+            session.add(JournalLine(
+                journal_entry_id=entry.id,
+                line_number=line_no,
+                account_id=accounts["4010"],
+                debit_amount=Decimal("0"),
+                credit_amount=pik_share,
+                memo=f"PIK interest income ({alloc.ownership_pct}% share)",
+            ))
+
+        entries_created.append(entry)
+
+    # Preserve the 1-to-1 link for non-syndicated loans (single allocation case).
+    # For syndicated (multiple entries), reverse-traverse via reference_id instead.
+    if len(entries_created) == 1:
+        accrual.journal_entry_id = entries_created[0].id
+
+    # Loan-level balances move once, not per-fund.
     loan.accrued_interest += accrued_amount
     if pik_amount > 0:
-        loan.current_principal += pik_amount  # PIK capitalises into principal
+        loan.current_principal += pik_amount
 
     return True
 

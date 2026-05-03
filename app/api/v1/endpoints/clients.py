@@ -24,6 +24,8 @@ async def list_clients(
 ):
     """List clients with KPI rollups across all their portfolios/loans."""
     where = "" if include_closed else "WHERE c.status = 'active'"
+    # Phase 2: dollar fields prorated through loan_allocation; loan counts un-prorated.
+    # Portfolio counts unchanged (driven by client→portfolio FK).
     sql = f"""
         SELECT
             c.id, c.name, c.legal_name, c.status, c.notes, c.closed_at, c.created_at,
@@ -31,15 +33,16 @@ async def list_clients(
             COUNT(DISTINCT p.id) AS total_portfolio_count,
             COUNT(DISTINCT l.id) FILTER (WHERE l.status NOT IN ('paid_off','written_off')) AS active_loan_count,
             COUNT(DISTINCT l.id) AS total_loan_count,
-            COALESCE(SUM(l.commitment_amount) FILTER (WHERE l.status NOT IN ('paid_off','written_off')), 0) AS total_commitment,
-            COALESCE(SUM(l.current_principal), 0) AS total_principal_outstanding,
-            COALESCE(SUM(l.accrued_interest), 0) AS total_accrued_interest,
-            COALESCE(SUM(l.accrued_fees), 0) AS total_accrued_fees,
+            COALESCE(SUM(l.commitment_amount * a.ownership_pct / 100) FILTER (WHERE l.status NOT IN ('paid_off','written_off')), 0) AS total_commitment,
+            COALESCE(SUM(l.current_principal * a.ownership_pct / 100), 0) AS total_principal_outstanding,
+            COALESCE(SUM(l.accrued_interest * a.ownership_pct / 100), 0) AS total_accrued_interest,
+            COALESCE(SUM(l.accrued_fees * a.ownership_pct / 100), 0) AS total_accrued_fees,
             COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'delinquent') AS delinquent_loan_count,
             COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'default') AS default_loan_count
         FROM client c
         LEFT JOIN portfolio p ON p.client_id = c.id
-        LEFT JOIN loan l ON l.portfolio_id = p.id
+        LEFT JOIN loan_allocation a ON a.portfolio_id = p.id AND a.end_date IS NULL
+        LEFT JOIN loan l ON l.id = a.loan_id
         {where}
         GROUP BY c.id, c.name, c.legal_name, c.status, c.notes, c.closed_at, c.created_at
         ORDER BY c.status, c.name
@@ -85,15 +88,16 @@ async def get_client(
                 COUNT(DISTINCT p.id) AS total_portfolio_count,
                 COUNT(DISTINCT l.id) FILTER (WHERE l.status NOT IN ('paid_off','written_off')) AS active_loan_count,
                 COUNT(DISTINCT l.id) AS total_loan_count,
-                COALESCE(SUM(l.commitment_amount) FILTER (WHERE l.status NOT IN ('paid_off','written_off')), 0) AS total_commitment,
-                COALESCE(SUM(l.current_principal), 0) AS total_principal_outstanding,
-                COALESCE(SUM(l.accrued_interest), 0) AS total_accrued_interest,
-                COALESCE(SUM(l.accrued_fees), 0) AS total_accrued_fees,
+                COALESCE(SUM(l.commitment_amount * a.ownership_pct / 100) FILTER (WHERE l.status NOT IN ('paid_off','written_off')), 0) AS total_commitment,
+                COALESCE(SUM(l.current_principal * a.ownership_pct / 100), 0) AS total_principal_outstanding,
+                COALESCE(SUM(l.accrued_interest * a.ownership_pct / 100), 0) AS total_accrued_interest,
+                COALESCE(SUM(l.accrued_fees * a.ownership_pct / 100), 0) AS total_accrued_fees,
                 COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'delinquent') AS delinquent_loan_count,
                 COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'default') AS default_loan_count
             FROM client c
             LEFT JOIN portfolio p ON p.client_id = c.id
-            LEFT JOIN loan l ON l.portfolio_id = p.id
+            LEFT JOIN loan_allocation a ON a.portfolio_id = p.id AND a.end_date IS NULL
+            LEFT JOIN loan l ON l.id = a.loan_id
             WHERE c.id = :cid
             GROUP BY c.id, c.name, c.legal_name, c.status, c.notes, c.closed_at, c.created_at
         """),
@@ -161,13 +165,18 @@ async def close_client(
     """
     Close a client. Requires all loans under this client to be paid_off or written_off.
     """
-    # Validate: no active loans
+    # Validate: no active allocations to active loans under this client's portfolios.
+    # Uses loan_allocation rather than loan.portfolio_id — captures real economic
+    # exposure (a fund that bought into a loan via allocation counts; a fund that
+    # transferred its share away does not).
     result = await db.execute(
         text("""
             SELECT COUNT(*) AS active_count
-            FROM loan l
-            JOIN portfolio p ON p.id = l.portfolio_id
+            FROM loan_allocation a
+            JOIN loan l      ON l.id = a.loan_id
+            JOIN portfolio p ON p.id = a.portfolio_id
             WHERE p.client_id = :cid
+              AND a.end_date IS NULL
               AND l.status NOT IN ('paid_off','written_off')
         """),
         {"cid": client_id}

@@ -122,40 +122,53 @@ class ReportingService:
     ) -> PortfolioSummaryReport:
         as_of = as_of_date or date.today()
 
-        pf_loan = f"AND l.portfolio_id = '{portfolio_id}'" if portfolio_id else ""
+        # Phase 2: rollup is allocation-aware.
+        # - loan/delinquency stats join through loan_allocation (active as-of :as_of)
+        # - dollar SUMs are prorated by ownership_pct / 100
+        # - weighted-avg numerator and denominator both use ownership_pct (the /100 cancels)
+        # - filter pf_loan keys off a.portfolio_id (the allocating fund), not l.portfolio_id
+        pf_loan = f"AND a.portfolio_id = '{portfolio_id}'" if portfolio_id else ""
         pf_port = f"AND p.id = '{portfolio_id}'" if portfolio_id else ""
 
         sql = text(f"""
             WITH loan_stats AS (
                 SELECT
-                    l.portfolio_id,
+                    a.portfolio_id,
                     COUNT(*)                                                FILTER (WHERE l.status NOT IN ('boarding','paid_off','charged_off','transferred'))  AS loan_count_total,
                     COUNT(*)                                                FILTER (WHERE l.status = 'funded')          AS loan_count_funded,
                     COUNT(*)                                                FILTER (WHERE l.status = 'delinquent')      AS loan_count_delinquent,
                     COUNT(*)                                                FILTER (WHERE l.status = 'default')         AS loan_count_default,
                     COUNT(*)                                                FILTER (WHERE l.status = 'workout')         AS loan_count_workout,
                     COUNT(*)                                                FILTER (WHERE l.status = 'paid_off')        AS loan_count_paid_off,
-                    COALESCE(SUM(l.commitment_amount),       0)             AS total_committed,
-                    COALESCE(SUM(l.current_principal),       0)             AS total_outstanding_principal,
-                    COALESCE(SUM(l.accrued_interest),        0)             AS total_accrued_interest,
-                    COALESCE(SUM(l.accrued_fees),            0)             AS total_accrued_fees,
-                    COALESCE(SUM(l.current_principal + l.accrued_interest + l.accrued_fees), 0) AS total_exposure,
-                    CASE WHEN SUM(l.current_principal) > 0
-                         THEN SUM(l.coupon_rate * l.current_principal) / SUM(l.current_principal)
+                    COALESCE(SUM(l.commitment_amount * a.ownership_pct / 100), 0) AS total_committed,
+                    COALESCE(SUM(l.current_principal * a.ownership_pct / 100), 0) AS total_outstanding_principal,
+                    COALESCE(SUM(l.accrued_interest  * a.ownership_pct / 100), 0) AS total_accrued_interest,
+                    COALESCE(SUM(l.accrued_fees      * a.ownership_pct / 100), 0) AS total_accrued_fees,
+                    COALESCE(SUM((l.current_principal + l.accrued_interest + l.accrued_fees) * a.ownership_pct / 100), 0) AS total_exposure,
+                    CASE WHEN SUM(l.current_principal * a.ownership_pct) > 0
+                         THEN SUM(l.coupon_rate * l.current_principal * a.ownership_pct) / SUM(l.current_principal * a.ownership_pct)
                          ELSE NULL END                                      AS weighted_avg_coupon,
-                    CASE WHEN SUM(l.current_principal) > 0
-                         THEN SUM((l.maturity_date - :as_of) * l.current_principal) / SUM(l.current_principal) / 365.25
+                    CASE WHEN SUM(l.current_principal * a.ownership_pct) > 0
+                         THEN SUM((l.maturity_date - :as_of) * l.current_principal * a.ownership_pct) / SUM(l.current_principal * a.ownership_pct) / 365.25
                          ELSE NULL END                                      AS weighted_avg_maturity_years
                 FROM loan l
+                JOIN loan_allocation a
+                  ON a.loan_id = l.id
+                 AND a.effective_date <= :as_of
+                 AND (a.end_date IS NULL OR a.end_date > :as_of)
                 WHERE l.status NOT IN ('boarding', 'transferred')
                   {pf_loan}
-                GROUP BY l.portfolio_id
+                GROUP BY a.portfolio_id
             ),
             delinquency_stats AS (
                 SELECT
-                    l.portfolio_id,
-                    COALESCE(SUM(dr.total_past_due), 0)  AS total_past_due_amount
+                    a.portfolio_id,
+                    COALESCE(SUM(dr.total_past_due * a.ownership_pct / 100), 0)  AS total_past_due_amount
                 FROM loan l
+                JOIN loan_allocation a
+                  ON a.loan_id = l.id
+                 AND a.effective_date <= :as_of
+                 AND (a.end_date IS NULL OR a.end_date > :as_of)
                 JOIN LATERAL (
                     SELECT total_past_due
                     FROM delinquency_record
@@ -165,7 +178,7 @@ class ReportingService:
                     LIMIT 1
                 ) dr ON true
                 WHERE 1=1 {pf_loan}
-                GROUP BY l.portfolio_id
+                GROUP BY a.portfolio_id
             )
             SELECT
                 p.id                            AS portfolio_id,
@@ -250,30 +263,38 @@ class ReportingService:
     ) -> AgingReport:
         as_of = as_of_date or date.today()
 
-        # Per-loan delinquency detail
-        sql = text("""
+        # Allocation-aware: one row per (loan × active allocation). Dollar columns
+        # are pro-rated by ownership_pct/100. portfolio_name is the allocating fund's
+        # name (a.portfolio_id), not the lead-fund pointer (l.portfolio_id).
+        pf_alloc = f"AND a.portfolio_id = '{portfolio_id}'" if portfolio_id else ""
+
+        sql = text(f"""
             SELECT
                 l.id                        AS loan_id,
                 l.loan_number,
                 l.loan_name,
-                l.current_principal,
+                (l.current_principal * a.ownership_pct / 100)  AS current_principal,
                 l.maturity_date,
                 l.rate_type,
                 l.coupon_rate               AS effective_rate,
                 c.legal_name                AS borrower_name,
                 p.name                      AS portfolio_name,
-                -- Latest delinquency record
-                COALESCE(dr.days_past_due, 0)               AS days_past_due,
-                COALESCE(dr.principal_past_due, 0)          AS principal_past_due,
-                COALESCE(dr.interest_past_due, 0)           AS interest_past_due,
-                COALESCE(dr.fees_past_due, 0)               AS fees_past_due,
-                COALESCE(dr.total_past_due, 0)              AS total_past_due,
-                -- Last payment
+                -- Latest delinquency record (pro-rated)
+                COALESCE(dr.days_past_due, 0)                                   AS days_past_due,
+                COALESCE(dr.principal_past_due * a.ownership_pct / 100, 0)      AS principal_past_due,
+                COALESCE(dr.interest_past_due  * a.ownership_pct / 100, 0)      AS interest_past_due,
+                COALESCE(dr.fees_past_due      * a.ownership_pct / 100, 0)      AS fees_past_due,
+                COALESCE(dr.total_past_due     * a.ownership_pct / 100, 0)      AS total_past_due,
+                -- Last payment (loan-level, not pro-rated — the wire was for the full amount)
                 lp.received_date            AS last_payment_date,
                 lp.gross_amount             AS last_payment_amount
             FROM loan l
+            JOIN loan_allocation a
+              ON a.loan_id = l.id
+             AND a.effective_date <= :as_of
+             AND (a.end_date IS NULL OR a.end_date > :as_of)
+            JOIN portfolio p        ON p.id = a.portfolio_id
             JOIN counterparty c     ON c.id = l.primary_borrower_id
-            JOIN portfolio p        ON p.id = l.portfolio_id
             LEFT JOIN LATERAL (
                 SELECT days_past_due, principal_past_due, interest_past_due,
                        fees_past_due, total_past_due
@@ -292,13 +313,12 @@ class ReportingService:
                 LIMIT 1
             ) lp ON true
             WHERE l.status IN ('funded','modified','delinquent','default','workout','payoff_pending')
-              
+              {pf_alloc}
             ORDER BY COALESCE(dr.days_past_due, 0) DESC, l.current_principal DESC
         """)
 
         result = await self.db.execute(sql, {
             "as_of": as_of,
-            
         })
         rows = result.mappings().all()
 
@@ -378,36 +398,45 @@ class ReportingService:
         # Build period buckets
         periods_meta = self._build_cash_periods(period_start, period_end, frequency)
 
-        # Scheduled payments for each period
-        scheduled_sql = text("""
+        # Allocation-aware: scheduled and collected cash get pro-rated by
+        # ownership_pct/100 against the portfolio's share. Active allocations
+        # only — uses end_date IS NULL (period end is a single point in time
+        # but the allocation set we care about is "what's active now"; for
+        # a historical cash-position report this would need as-of refinement).
+        pf_alloc = f"AND a.portfolio_id = '{portfolio_id}'" if portfolio_id else ""
+
+        scheduled_sql = text(f"""
             SELECT
                 ps.due_date,
-                COALESCE(SUM(ps.scheduled_principal), 0)    AS sched_principal,
-                COALESCE(SUM(ps.scheduled_interest),  0)    AS sched_interest,
-                COALESCE(SUM(ps.scheduled_fees),      0)    AS sched_fees
+                COALESCE(SUM(ps.scheduled_principal * a.ownership_pct / 100), 0) AS sched_principal,
+                COALESCE(SUM(ps.scheduled_interest  * a.ownership_pct / 100), 0) AS sched_interest,
+                COALESCE(SUM(ps.scheduled_fees      * a.ownership_pct / 100), 0) AS sched_fees
             FROM payment_schedule ps
             JOIN loan l ON l.id = ps.loan_id
+            JOIN loan_allocation a
+              ON a.loan_id = l.id AND a.end_date IS NULL
             WHERE ps.is_current = true
               AND ps.due_date BETWEEN :start AND :end
-              
+              {pf_alloc}
             GROUP BY ps.due_date
             ORDER BY ps.due_date
         """)
 
-        # Actual collections for each period
-        collected_sql = text("""
+        collected_sql = text(f"""
             SELECT
                 py.effective_date,
-                COALESCE(SUM(py.applied_to_principal), 0)   AS coll_principal,
-                COALESCE(SUM(py.applied_to_interest),  0)   AS coll_interest,
-                COALESCE(SUM(py.applied_to_fees),      0)   AS coll_fees,
-                COUNT(*) FILTER (WHERE py.status = 'posted')    AS payments_received,
-                COUNT(*) FILTER (WHERE py.status = 'returned')  AS payments_returned
+                COALESCE(SUM(py.applied_to_principal * a.ownership_pct / 100), 0) AS coll_principal,
+                COALESCE(SUM(py.applied_to_interest  * a.ownership_pct / 100), 0) AS coll_interest,
+                COALESCE(SUM(py.applied_to_fees      * a.ownership_pct / 100), 0) AS coll_fees,
+                COUNT(DISTINCT py.id) FILTER (WHERE py.status = 'posted')   AS payments_received,
+                COUNT(DISTINCT py.id) FILTER (WHERE py.status = 'returned') AS payments_returned
             FROM payment py
             JOIN loan l ON l.id = py.loan_id
+            JOIN loan_allocation a
+              ON a.loan_id = l.id AND a.end_date IS NULL
             WHERE py.effective_date BETWEEN :start AND :end
               AND py.status IN ('posted','returned')
-              
+              {pf_alloc}
             GROUP BY py.effective_date
             ORDER BY py.effective_date
         """)
@@ -415,7 +444,6 @@ class ReportingService:
         params = {
             "start": period_start,
             "end": period_end,
-            
         }
 
         sched_result = await self.db.execute(scheduled_sql, params)
@@ -504,25 +532,27 @@ class ReportingService:
         as_of: date,
         portfolio_id: Optional[UUID],
     ) -> tuple[Decimal, Decimal, Decimal]:
-        """Sum of scheduled payments due in next 30/60/90 days."""
-        sql = text("""
+        """Sum of scheduled payments due in next 30/60/90 days, pro-rated by allocation."""
+        pf_alloc = f"AND a.portfolio_id = '{portfolio_id}'" if portfolio_id else ""
+        sql = text(f"""
             SELECT
-                COALESCE(SUM(ps.total_scheduled) FILTER (WHERE ps.due_date <= :d30), 0) AS fwd_30,
-                COALESCE(SUM(ps.total_scheduled) FILTER (WHERE ps.due_date <= :d60), 0) AS fwd_60,
-                COALESCE(SUM(ps.total_scheduled) FILTER (WHERE ps.due_date <= :d90), 0) AS fwd_90
+                COALESCE(SUM(ps.total_scheduled * a.ownership_pct / 100) FILTER (WHERE ps.due_date <= :d30), 0) AS fwd_30,
+                COALESCE(SUM(ps.total_scheduled * a.ownership_pct / 100) FILTER (WHERE ps.due_date <= :d60), 0) AS fwd_60,
+                COALESCE(SUM(ps.total_scheduled * a.ownership_pct / 100) FILTER (WHERE ps.due_date <= :d90), 0) AS fwd_90
             FROM payment_schedule ps
             JOIN loan l ON l.id = ps.loan_id
+            JOIN loan_allocation a
+              ON a.loan_id = l.id AND a.end_date IS NULL
             WHERE ps.is_current = true
               AND ps.status IN ('open','partial')
               AND ps.due_date > :as_of
-              
+              {pf_alloc}
         """)
         result = await self.db.execute(sql, {
             "as_of": as_of,
             "d30": as_of + timedelta(days=30),
             "d60": as_of + timedelta(days=60),
             "d90": as_of + timedelta(days=90),
-            
         })
         row = result.mappings().one()
         return (
@@ -544,46 +574,51 @@ class ReportingService:
         as_of = as_of_date or date.today()
         cutoff = as_of + timedelta(days=horizon_days)
 
-        sql = text("""
+        # Allocation-aware: one row per (loan × active allocation). Principal,
+        # accrued interest, and total exposure are pro-rated by ownership_pct/100.
+        # portfolio_name is the allocating fund (a.portfolio_id), not the lead.
+        pf_alloc = f"AND a.portfolio_id = '{portfolio_id}'" if portfolio_id else ""
+        sql = text(f"""
             SELECT
                 l.id                AS loan_id,
                 l.loan_number,
                 l.loan_name,
                 l.maturity_date,
-                l.current_principal,
-                l.accrued_interest,
-                l.current_principal + l.accrued_interest + l.accrued_fees  AS total_exposure,
+                (l.current_principal * a.ownership_pct / 100)  AS current_principal,
+                (l.accrued_interest  * a.ownership_pct / 100)  AS accrued_interest,
+                ((l.current_principal + l.accrued_interest + l.accrued_fees) * a.ownership_pct / 100)  AS total_exposure,
                 l.status            AS loan_status,
                 l.rate_type,
                 l.coupon_rate       AS effective_rate,
                 (l.maturity_date - :as_of)  AS days_to_maturity,
                 c.legal_name        AS borrower_name,
                 p.name              AS portfolio_name,
-                -- Is there an active payoff quote?
                 EXISTS (
                     SELECT 1 FROM payoff_quote pq
                     WHERE pq.loan_id = l.id
                       AND pq.status = 'active'
                       AND pq.good_through_date >= :as_of
                 ) AS payoff_quote_active,
-                -- Is there an active workout?
                 EXISTS (
                     SELECT 1 FROM workout_plan wp
                     WHERE wp.loan_id = l.id AND wp.status = 'active'
                 ) AS workout_plan_active
             FROM loan l
+            JOIN loan_allocation a
+              ON a.loan_id = l.id
+             AND a.effective_date <= :as_of
+             AND (a.end_date IS NULL OR a.end_date > :as_of)
+            JOIN portfolio p    ON p.id = a.portfolio_id
             JOIN counterparty c ON c.id = l.primary_borrower_id
-            JOIN portfolio p    ON p.id = l.portfolio_id
             WHERE l.status IN ('funded','modified','delinquent','default','workout')
               AND l.maturity_date <= :cutoff
-              
+              {pf_alloc}
             ORDER BY l.maturity_date ASC
         """)
 
         result = await self.db.execute(sql, {
             "as_of": as_of,
             "cutoff": cutoff,
-            
         })
         rows = result.mappings().all()
 
@@ -660,7 +695,11 @@ class ReportingService:
     ) -> PayoffPipelineReport:
         as_of = as_of_date or date.today()
 
-        sql = text("""
+        # Allocation-aware: one row per (active payoff quote × active allocation).
+        # Quote dollar columns (principal/interest/fees/penalty/total/per_diem) are
+        # pro-rated by ownership_pct/100 — that's each fund's share of the payoff cash.
+        pf_alloc = f"AND a.portfolio_id = '{portfolio_id}'" if portfolio_id else ""
+        sql = text(f"""
             SELECT
                 l.id            AS loan_id,
                 l.loan_number,
@@ -672,25 +711,28 @@ class ReportingService:
                 pq.quote_date,
                 pq.good_through_date,
                 (pq.good_through_date - :as_of)     AS expires_in_days,
-                pq.principal_balance,
-                pq.accrued_interest,
-                pq.fees_outstanding,
-                pq.prepayment_penalty,
-                pq.total_payoff,
-                pq.per_diem,
+                (pq.principal_balance   * a.ownership_pct / 100) AS principal_balance,
+                (pq.accrued_interest    * a.ownership_pct / 100) AS accrued_interest,
+                (pq.fees_outstanding    * a.ownership_pct / 100) AS fees_outstanding,
+                (pq.prepayment_penalty  * a.ownership_pct / 100) AS prepayment_penalty,
+                (pq.total_payoff        * a.ownership_pct / 100) AS total_payoff,
+                (pq.per_diem            * a.ownership_pct / 100) AS per_diem,
                 pq.status       AS quote_status
             FROM payoff_quote pq
             JOIN loan l         ON l.id = pq.loan_id
+            JOIN loan_allocation a
+              ON a.loan_id = l.id
+             AND a.effective_date <= :as_of
+             AND (a.end_date IS NULL OR a.end_date > :as_of)
+            JOIN portfolio p    ON p.id = a.portfolio_id
             JOIN counterparty c ON c.id = l.primary_borrower_id
-            JOIN portfolio p    ON p.id = l.portfolio_id
             WHERE pq.status = 'active'
-              
+              {pf_alloc}
             ORDER BY pq.good_through_date ASC
         """)
 
         result = await self.db.execute(sql, {
             "as_of": as_of,
-            
         })
         rows = result.mappings().all()
 
@@ -745,7 +787,19 @@ class ReportingService:
     ) -> CollectorProductivityReport:
         as_of = date.today()
 
-        sql = text("""
+        # Operational report — collector activity counts per user. Filter-only:
+        # when portfolio_id is given, restrict to loans with an active allocation
+        # in that fund. Activity counts are loan-level human work (no pro-ration).
+        pf_exists = (
+            "AND EXISTS ("
+            " SELECT 1 FROM loan_allocation la"
+            " WHERE la.loan_id = l.id"
+            f" AND la.portfolio_id = '{portfolio_id}'"
+            " AND la.end_date IS NULL"
+            ")"
+        ) if portfolio_id else ""
+
+        sql = text(f"""
             WITH activity_stats AS (
                 SELECT
                     ca.performed_by                                         AS user_id,
@@ -760,11 +814,9 @@ class ReportingService:
                 FROM collections_activity ca
                 JOIN loan l ON l.id = ca.loan_id
                 WHERE ca.activity_date BETWEEN :start AND :end
-                  
+                  {pf_exists}
                 GROUP BY ca.performed_by
             ),
-            -- Loans that moved from delinquent/default to funded/modified in the period
-            -- attributed to the last collector who touched them
             resolutions AS (
                 SELECT
                     ca.performed_by     AS user_id,
@@ -773,7 +825,7 @@ class ReportingService:
                 JOIN loan l ON l.id = ca.loan_id
                 WHERE ca.activity_date BETWEEN :start AND :end
                   AND l.status IN ('funded', 'modified')
-                  
+                  {pf_exists}
                 GROUP BY ca.performed_by
             )
             SELECT
@@ -795,7 +847,6 @@ class ReportingService:
         result = await self.db.execute(sql, {
             "start": datetime.combine(period_start, datetime.min.time()),
             "end": datetime.combine(period_end, datetime.max.time()),
-            
         })
         rows = result.mappings().all()
 
@@ -859,7 +910,22 @@ class ReportingService:
     ) -> ExceptionReport:
         as_of = as_of_date or date.today()
 
-        sql = text("""
+        # Operational report — one row per workflow_task, NOT per allocation.
+        # Filter-only: when portfolio_id is given, restrict to loans with an
+        # active allocation in that fund. Dollar columns are not pro-rated;
+        # current_principal here is the loan's full balance (operational context).
+        # portfolio_name is the lead-fund pointer (l.portfolio_id) for stable display.
+        pf_exists = (
+            "AND EXISTS ("
+            " SELECT 1 FROM loan_allocation a"
+            " WHERE a.loan_id = l.id"
+            f" AND a.portfolio_id = '{portfolio_id}'"
+            " AND a.effective_date <= :as_of"
+            " AND (a.end_date IS NULL OR a.end_date > :as_of)"
+            ")"
+        ) if portfolio_id else ""
+
+        sql = text(f"""
             SELECT
                 wt.id               AS task_id,
                 wt.task_type        AS exception_type,
@@ -875,13 +941,13 @@ class ReportingService:
                 l.current_principal,
                 c.legal_name        AS borrower_name,
                 p.name              AS portfolio_name,
-                -- Assignee name would come from shared.users in full impl
                 NULL::text          AS assigned_to
             FROM workflow_task wt
             JOIN loan l         ON l.id = wt.loan_id
             JOIN counterparty c ON c.id = l.primary_borrower_id
             JOIN portfolio p    ON p.id = l.portfolio_id
             WHERE wt.status IN ('open','in_progress','escalated')
+              {pf_exists}
             ORDER BY
                 CASE wt.priority
                     WHEN 'critical' THEN 1
@@ -894,7 +960,6 @@ class ReportingService:
 
         result = await self.db.execute(sql, {
             "as_of": as_of,
-            
         })
         rows = result.mappings().all()
 

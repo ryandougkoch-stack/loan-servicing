@@ -42,6 +42,29 @@ class Portfolio(Base, AuditMixin):
 
 
 # ---------------------------------------------------------------------------
+# LoanAllocation (syndication: a loan held across multiple portfolios/funds)
+# ---------------------------------------------------------------------------
+
+class LoanAllocation(Base, AuditMixin):
+    __tablename__ = "loan_allocation"
+
+    loan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("loan.id"), nullable=False, index=True
+    )
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("portfolio.id"), nullable=False, index=True
+    )
+    ownership_pct: Mapped[Decimal] = mapped_column(Numeric(9, 6), nullable=False)
+    effective_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[Optional[date]] = mapped_column(Date)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+
+    loan: Mapped["Loan"] = relationship("Loan", foreign_keys=[loan_id])
+    portfolio: Mapped["Portfolio"] = relationship("Portfolio", foreign_keys=[portfolio_id])
+
+
+# ---------------------------------------------------------------------------
 # Counterparty
 # ---------------------------------------------------------------------------
 

@@ -77,8 +77,23 @@ class LoanService:
         count_stmt = select(func.count()).select_from(Loan)
 
         if portfolio_id:
-            stmt = stmt.where(Loan.portfolio_id == portfolio_id)
-            count_stmt = count_stmt.where(Loan.portfolio_id == portfolio_id)
+            # Phase 2: filter through loan_allocation so syndicated loans surface
+            # in every fund that holds them, not just the lead fund.
+            from app.models.portfolio import LoanAllocation
+            stmt = (
+                stmt.join(LoanAllocation, LoanAllocation.loan_id == Loan.id)
+                .where(
+                    LoanAllocation.portfolio_id == portfolio_id,
+                    LoanAllocation.end_date.is_(None),
+                )
+            )
+            count_stmt = (
+                count_stmt.join(LoanAllocation, LoanAllocation.loan_id == Loan.id)
+                .where(
+                    LoanAllocation.portfolio_id == portfolio_id,
+                    LoanAllocation.end_date.is_(None),
+                )
+            )
         if status_filter:
             stmt = stmt.where(Loan.status == status_filter)
             count_stmt = count_stmt.where(Loan.status == status_filter)
@@ -156,6 +171,12 @@ class LoanService:
 
         self.db.add(loan)
         await self.db.flush()  # get the ID without committing
+
+        # Auto-create the default 100% allocation so the loan always has an
+        # active row in loan_allocation. Phase 2 KPI rollups join through
+        # loan_allocation, so a loan without one would silently disappear.
+        from app.services.loan_allocation_service import LoanAllocationService
+        await LoanAllocationService(self.db).create_initial_allocation(loan, created_by)
 
         logger.info(
             "loan_created",

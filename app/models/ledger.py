@@ -90,6 +90,7 @@ class Payment(Base):
     applied_to_escrow: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     applied_to_advances: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     held_in_suspense: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    applied_to_penalty: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     period_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("payment_schedule.id"))
     reference_number: Mapped[Optional[str]] = mapped_column(String(100))
     bank_account_last4: Mapped[Optional[str]] = mapped_column(String(4))

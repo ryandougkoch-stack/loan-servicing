@@ -12,6 +12,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.loan import Loan
+from app.schemas.payment import PaymentCreate
+from app.services.payment_service import PaymentService
 
 logger = structlog.get_logger(__name__)
 
@@ -104,19 +106,45 @@ class PayoffService:
         expected = Decimal(quote["total_payoff_amount"])
         if abs(amount_received - expected) > Decimal("1.00"):
             raise ValueError(f"Payoff amount mismatch. Expected ${expected}, received ${amount_received}.")
-        loan.current_principal = Decimal("0.00")
-        loan.accrued_interest = Decimal("0.00")
-        loan.accrued_fees = Decimal("0.00")
+
+        # Route the payoff cash through PaymentService so it lands in the GL
+        # (allocation-aware split, Payment record for audit + reporting, plus the
+        # waterfall correctly clears principal/interest/fees and recognizes the
+        # prepayment penalty as income via account 4040). Compute the penalty
+        # here — payoff_service owns the penalty schedule logic.
+        penalty, _ = self._calculate_prepayment_penalty(loan, payoff_date)
+
+        payment_payload = PaymentCreate(
+            loan_id=loan.id,
+            payment_type="payoff",
+            payment_method="wire",  # standard for payoffs; future: pass through from API
+            received_date=payoff_date,
+            effective_date=payoff_date,
+            gross_amount=amount_received,
+        )
+        payment = await PaymentService(self.db).post_payment(
+            payload=payment_payload,
+            posted_by=user_id,
+            prepayment_penalty=penalty,
+        )
+
+        # post_payment already cleared principal/interest/fees via the waterfall;
+        # flip the loan to paid_off after that's persisted.
         loan.status = "paid_off"
         loan.paid_off_at = payoff_date
         await self.db.flush()
         logger.info("loan_paid_off", loan_id=str(loan.id),
                     payoff_date=payoff_date.isoformat(),
-                    amount_received=str(amount_received))
+                    amount_received=str(amount_received),
+                    penalty=str(penalty),
+                    payment_id=str(payment.id))
         return {
             "loan_id": str(loan.id),
             "loan_number": loan.loan_number,
             "status": "paid_off",
             "paid_off_at": payoff_date.isoformat(),
             "amount_received": str(amount_received),
+            "payment_id": str(payment.id),
+            "payment_number": payment.payment_number,
+            "prepayment_penalty": str(penalty),
         }
