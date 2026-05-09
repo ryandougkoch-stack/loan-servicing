@@ -63,14 +63,42 @@ async def create_loan(
     user_id: UUID = Depends(get_current_user_id),
 ):
     """
-    Board a new loan. Status starts as 'boarding'.
-    Triggers validation rules before persisting.
+    Board a new loan. Two paths:
+      - Fresh origination (no conversion block) — status starts at 'boarding'
+      - Mid-term conversion (conversion block present) — status starts at
+        'funded' with opening balances and a posted opening journal entry.
     """
     service = LoanService(db)
-    loan = await service.create_loan(payload, created_by=user_id)
-
     from app.services.activity_service import ActivityService
     activity_svc = ActivityService(db)
+
+    if payload.conversion is not None:
+        loan = await service.create_converted_loan(payload, created_by=user_id)
+        conv = payload.conversion
+        await activity_svc.log(
+            loan_id=loan.id,
+            event_type="converted",
+            event_summary=(
+                f"Loan converted from prior servicer — {loan.loan_number} "
+                f"as of {conv.as_of_date}, principal ${conv.current_principal}, "
+                f"accrued interest ${conv.accrued_interest}"
+            ),
+            field_changes={
+                "as_of_date": {"new": str(conv.as_of_date)},
+                "current_principal": {"new": str(conv.current_principal)},
+                "accrued_interest": {"new": str(conv.accrued_interest)},
+                "accrued_fees": {"new": str(conv.accrued_fees)},
+                "last_payment_date": {"new": str(conv.last_payment_date) if conv.last_payment_date else None},
+                "next_due_date": {"new": str(conv.next_due_date) if conv.next_due_date else None},
+                "prior_servicer_name": {"new": conv.prior_servicer_name},
+                "prior_servicer_loan_id": {"new": conv.prior_servicer_loan_id},
+                "boarding_type": {"new": "converted"},
+            },
+            user_id=user_id,
+        )
+        return LoanRead.model_validate(loan)
+
+    loan = await service.create_loan(payload, created_by=user_id)
     await activity_svc.log(
         loan_id=loan.id,
         event_type="boarded",

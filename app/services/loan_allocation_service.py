@@ -108,12 +108,16 @@ class LoanAllocationService:
     # -------------------------------------------------------------------------
 
     async def create_initial_allocation(
-        self, loan: Loan, created_by: UUID
+        self, loan: Loan, created_by: UUID, effective_date: Optional[date] = None
     ) -> LoanAllocation:
         """
         Insert the default 100% allocation for a brand-new loan.
         Called from LoanService.create_loan after the loan row is flushed.
         Idempotent: skips if any allocation row already exists for this loan.
+
+        effective_date defaults to loan.origination_date for fresh originations.
+        Converted loans pass as_of_date so the allocation doesn't back-date to a
+        period when we didn't own the loan.
         """
         existing = await self.db.execute(
             select(LoanAllocation.id)
@@ -127,7 +131,7 @@ class LoanAllocationService:
             loan_id=loan.id,
             portfolio_id=loan.portfolio_id,
             ownership_pct=PCT_TOTAL,
-            effective_date=loan.origination_date,
+            effective_date=effective_date or loan.origination_date,
             end_date=None,
             notes="Initial allocation (auto-created at loan boarding)",
             created_by=created_by,

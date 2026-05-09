@@ -80,6 +80,13 @@ class Loan(Base, AuditMixin):
     servicer_notes: Mapped[Optional[str]] = mapped_column(Text)
     created_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
 
+    # Conversion (mid-term boarding). 'originated' = funded fresh in this system;
+    # 'converted' = transferred mid-life from a prior servicer with opening
+    # balances supplied at as_of_date. accrual_start_date is null for originated
+    # loans (accrual starts at funded_at) and equals as_of_date for converted.
+    boarding_type: Mapped[str] = mapped_column(String(15), nullable=False, default="originated")
+    accrual_start_date: Mapped[Optional[date]] = mapped_column(Date)
+
     # Relationships
     portfolio: Mapped["Portfolio"] = relationship("Portfolio", back_populates="loans")
     primary_borrower: Mapped["Counterparty"] = relationship("Counterparty", foreign_keys=[primary_borrower_id])

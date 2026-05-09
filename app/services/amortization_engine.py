@@ -140,6 +140,13 @@ class EngineInput:
     balloon_amount: Optional[Decimal] = None
     rate_steps: list[RateStep] = field(default_factory=list)
     custom_principal_schedule: Optional[dict[int, Decimal]] = None  # period_number → principal
+    # Forward-only mode (converted / mid-term boarded loans). When set, the
+    # engine generates periods from schedule_start_date to maturity_date
+    # using original_balance as the opening balance — the pre-cutover history
+    # lives on the prior servicer's books and is captured in LoanConversion's
+    # paid_to_date totals, not regenerated here.
+    schedule_start_date: Optional[date] = None
+    schedule_first_due: Optional[date] = None
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +169,21 @@ class AmortizationEngine:
         )
     """
 
-    def __init__(self, loan):
-        """Construct from a Loan ORM object."""
+    def __init__(
+        self,
+        loan,
+        schedule_start_date: Optional[date] = None,
+        schedule_first_due: Optional[date] = None,
+    ):
+        """
+        Construct from a Loan ORM object.
+
+        For mid-term-boarded (converted) loans, pass schedule_start_date
+        (= as_of_date) and schedule_first_due (= next_due_date) so the
+        engine generates only the forward-going periods using
+        loan.current_principal as the opening balance. Pre-cutover history
+        is captured separately on the LoanConversion record.
+        """
         freq_map = {
             "MONTHLY":     1,
             "QUARTERLY":   3,
@@ -195,6 +215,8 @@ class AmortizationEngine:
             rate_floor=loan.rate_floor,
             rate_cap=loan.rate_cap,
             interest_only_period_months=loan.interest_only_period_months or 0,
+            schedule_start_date=schedule_start_date,
+            schedule_first_due=schedule_first_due,
         )
         self._loan = loan
 
@@ -569,14 +591,26 @@ class AmortizationEngine:
           - Month-end roll: if origination is on the last day of the month,
             subsequent periods roll to month-end
           - The final period always ends on maturity_date
+          - Forward-only mode (converted loans): if schedule_start_date is set,
+            generation starts there with schedule_first_due as the first due
+            date instead of origination_date / first_payment_date.
         """
         inp = self.input
         periods = []
         freq = inp.payment_frequency_months
-        month_end_roll = self._is_month_end(inp.origination_date)
+        anchor_date = inp.schedule_start_date or inp.origination_date
+        month_end_roll = self._is_month_end(anchor_date)
 
-        current_start = inp.origination_date
-        current_due = inp.first_payment_date
+        current_start = inp.schedule_start_date or inp.origination_date
+        current_due = inp.schedule_first_due or inp.first_payment_date
+
+        # In forward-only mode the caller-supplied first-due may be in the past
+        # (a delinquent loan transferred to us). The schedule should still
+        # anchor on it so the delinquency engine sees the right overdue period.
+        # If the supplied first-due is somehow >= maturity_date, fall back to
+        # a single bullet-style period to maturity.
+        if current_due >= inp.maturity_date:
+            return [(current_start, inp.maturity_date, inp.maturity_date)]
 
         while True:
             current_end = current_due  # period ends on the due date (standard convention)

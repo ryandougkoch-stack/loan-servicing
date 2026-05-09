@@ -44,6 +44,43 @@ STATUS_TRANSITIONS = {
 # Create
 # ---------------------------------------------------------------------------
 
+class LoanConversionPayload(BaseModel):
+    """
+    Sub-block on LoanCreate signalling that this is a mid-term boarding
+    (transferred from a prior servicer) rather than a fresh origination.
+
+    Presence of this block on LoanCreate flips the boarding code path:
+      - status starts at 'funded', not 'boarding'
+      - accrual_start_date = as_of_date (instead of funded_at)
+      - opening journal entry posted on as_of_date
+      - allocation effective_date = as_of_date (not origination_date)
+      - LoanConversion record + activity event 'converted' written
+    """
+    as_of_date: date
+    current_principal: Decimal = Field(ge=0)
+    accrued_interest: Decimal = Field(default=Decimal("0"), ge=0)
+    accrued_fees: Decimal = Field(default=Decimal("0"), ge=0)
+
+    last_payment_date: Optional[date] = None
+    last_payment_amount: Optional[Decimal] = Field(None, ge=0)
+    next_due_date: Optional[date] = None
+
+    paid_to_date_principal: Decimal = Field(default=Decimal("0"), ge=0)
+    paid_to_date_interest: Decimal = Field(default=Decimal("0"), ge=0)
+    paid_to_date_fees: Decimal = Field(default=Decimal("0"), ge=0)
+
+    prior_servicer_name: Optional[str] = None
+    prior_servicer_loan_id: Optional[str] = None
+    conversion_document_id: Optional[UUID] = None
+    notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_conversion(self) -> "LoanConversionPayload":
+        if self.last_payment_date and self.last_payment_date > self.as_of_date:
+            raise ValueError("last_payment_date cannot be after as_of_date")
+        return self
+
+
 class LoanCreate(BaseModel):
     portfolio_id: UUID
     loan_number: Optional[str] = None          # auto-generated if omitted
@@ -84,6 +121,10 @@ class LoanCreate(BaseModel):
     investran_loan_id: Optional[str] = None
     servicer_notes: Optional[str] = None
 
+    # Conversion (mid-term boarding). When present, this is a transferred loan
+    # not a fresh origination — see LoanConversionPayload for behaviour change.
+    conversion: Optional[LoanConversionPayload] = None
+
     @model_validator(mode="after")
     def validate_loan(self) -> "LoanCreate":
         if self.rate_type not in VALID_RATE_TYPES:
@@ -98,6 +139,12 @@ class LoanCreate(BaseModel):
             raise ValueError("spread and index_code are required for floating rate loans")
         if self.rate_cap and self.rate_floor and self.rate_cap < self.rate_floor:
             raise ValueError("rate_cap must be >= rate_floor")
+        if self.conversion is not None:
+            c = self.conversion
+            if c.as_of_date < self.origination_date:
+                raise ValueError("conversion.as_of_date must be on or after origination_date")
+            if c.as_of_date >= self.maturity_date:
+                raise ValueError("conversion.as_of_date must be before maturity_date")
         return self
 
 
@@ -143,6 +190,8 @@ class LoanRead(BaseModel):
     investran_last_sync_at: Optional[datetime]
     funded_at: Optional[date]
     paid_off_at: Optional[date]
+    boarding_type: str
+    accrual_start_date: Optional[date]
     created_at: datetime
     updated_at: datetime
 

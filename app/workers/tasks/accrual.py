@@ -91,9 +91,19 @@ def run_daily_accrual_for_tenant(self, tenant_slug: str, accrual_date_str: str):
 
 async def _run_accrual(tenant_slug: str, accrual_date: date) -> None:
     async with get_tenant_session_context(tenant_slug) as session:
-        # Load all active loans
+        # Load all active loans whose accrual window has begun. Originated loans
+        # have accrual_start_date IS NULL — they accrue from the day status
+        # enters ACTIVE_STATUSES. Converted loans have accrual_start_date set
+        # to as_of_date and only start accruing on/after that date, so accruals
+        # don't fire for the period when the prior servicer owned the loan.
         result = await session.execute(
-            select(Loan).where(Loan.status.in_(ACTIVE_STATUSES))
+            select(Loan).where(
+                Loan.status.in_(ACTIVE_STATUSES),
+                or_(
+                    Loan.accrual_start_date.is_(None),
+                    Loan.accrual_start_date <= accrual_date,
+                ),
+            )
         )
         loans = result.scalars().all()
 
