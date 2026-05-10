@@ -8,7 +8,7 @@ from pathlib import Path
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
@@ -53,20 +53,25 @@ def create_app() -> FastAPI:
     # Routers
     # -------------------------------------------------------------------------
     from app.api.v1.router import api_router
-    from app.web.router import router as web_router
-
     app.include_router(api_router, prefix=settings.API_PREFIX)
-    app.include_router(web_router)
 
-    # Serve static assets (vendored Tailwind/HTMX could go here later;
-    # for now we rely on CDN, but the mount is wired so app.css works).
+    # Static assets + dashboard SPA. dashboard.html is a single-file vanilla-JS
+    # app that calls the JSON API directly with bearer JWT — served from
+    # disk; the FastAPI process itself is just the API backend.
     static_dir = Path(__file__).parent / "static"
     static_dir.mkdir(exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+    dashboard_file = static_dir / "dashboard.html"
+
     @app.get("/", include_in_schema=False)
-    async def root_redirect():
-        return RedirectResponse(url="/web", status_code=302)
+    async def serve_dashboard():
+        return FileResponse(str(dashboard_file))
+
+    @app.get("/dashboard.html", include_in_schema=False)
+    async def serve_dashboard_legacy():
+        # Honour the original filename people may have bookmarked.
+        return FileResponse(str(dashboard_file))
 
     # -------------------------------------------------------------------------
     # Startup / shutdown
