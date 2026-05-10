@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Sign in — LSP{% endblock %}
+{% block content %}
+<div class="max-w-md mx-auto bg-white border border-slate-200 rounded-lg shadow-sm p-8 mt-8">
+  <h1 class="text-2xl font-semibold mb-1">Sign in</h1>
+  <p class="text-sm text-slate-500 mb-6">Loan-servicing platform</p>
+
+  {% if error %}
+  <div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm rounded px-3 py-2 mb-4">
+    {{ error }}
+  </div>
+  {% endif %}
+
+  <form method="post" action="/web/login" class="space-y-4">
+    <div>
+      <label class="block text-sm font-medium mb-1">Email</label>
+      <input type="email" name="email" required autofocus
+             class="w-full border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+    </div>
+    <div>
+      <label class="block text-sm font-medium mb-1">Password</label>
+      <input type="password" name="password" required
+             class="w-full border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+    </div>
+    <div>
+      <label class="block text-sm font-medium mb-1">Tenant</label>
+      <input type="text" name="tenant_slug" required value="dev_fund" placeholder="e.g. dev_fund"
+             class="w-full border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+    </div>
+    <button type="submit"
+            class="w-full bg-slate-900 text-white py-2 rounded font-medium hover:bg-slate-800">
+      Sign in
+    </button>
+  </form>
+</div>
+{% endblock %}

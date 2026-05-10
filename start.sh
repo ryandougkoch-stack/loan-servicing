@@ -14,7 +14,7 @@ sleep 3
 echo "Starting Celery worker..."
 celery -A app.workers.celery_app worker \
   --loglevel=info \
-  --queues=accrual,delinquency \
+  --queues=accrual,delinquency,conversion \
   --concurrency=2 \
   --logfile=/tmp/celery_worker.log \
   --detach

@@ -26,6 +26,7 @@ celery_app = Celery(
     include=[
         "app.workers.tasks.accrual",
         "app.workers.tasks.delinquency",
+        "app.workers.tasks.batch_conversion",
     ],
 )
 
@@ -39,8 +40,9 @@ celery_app.conf.update(
     task_acks_late=True,            # re-queue on worker crash
     worker_prefetch_multiplier=1,   # one task at a time per worker (financial safety)
     task_routes={
-        "app.workers.tasks.accrual.*":    {"queue": "accrual"},
-        "app.workers.tasks.delinquency.*": {"queue": "delinquency"},
+        "app.workers.tasks.accrual.*":          {"queue": "accrual"},
+        "app.workers.tasks.delinquency.*":      {"queue": "delinquency"},
+        "app.workers.tasks.batch_conversion.*": {"queue": "conversion"},
     },
 )
 

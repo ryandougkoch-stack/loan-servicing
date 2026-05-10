@@ -1,0 +1,76 @@
+{% if error %}
+<div class="bg-rose-50 border border-rose-200 text-rose-800 rounded p-4">
+  <div class="font-semibold mb-1">Could not parse file</div>
+  <div class="text-sm">{{ error }}</div>
+</div>
+{% else %}
+<div class="bg-white border border-slate-200 rounded-lg shadow-sm p-6">
+  <h2 class="font-semibold mb-3">2. Review validation</h2>
+
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm mb-5">
+    <div class="bg-slate-50 rounded p-3">
+      <div class="text-xs uppercase text-slate-500">File</div>
+      <div class="font-mono text-xs break-all">{{ report.file_name }}</div>
+    </div>
+    <div class="bg-slate-50 rounded p-3">
+      <div class="text-xs uppercase text-slate-500">Sheets</div>
+      <div>{{ report.sheets_detected | join(", ") }}</div>
+    </div>
+    <div class="bg-emerald-50 rounded p-3">
+      <div class="text-xs uppercase text-emerald-700">Valid loans</div>
+      <div class="text-2xl font-semibold text-emerald-800 tabular-nums">{{ report.valid_loan_rows }}</div>
+    </div>
+    <div class="bg-rose-50 rounded p-3">
+      <div class="text-xs uppercase text-rose-700">Invalid loans</div>
+      <div class="text-2xl font-semibold text-rose-800 tabular-nums">{{ report.invalid_loan_rows }}</div>
+    </div>
+  </div>
+
+  <h3 class="font-medium text-sm uppercase tracking-wide text-slate-600 mb-2">Per-row outcome</h3>
+  <table class="w-full text-sm border border-slate-200 rounded overflow-hidden mb-4">
+    <thead class="bg-slate-100 text-xs uppercase text-slate-600 tracking-wide">
+      <tr>
+        <th class="text-left px-3 py-2">Sheet</th>
+        <th class="text-left px-3 py-2">Row</th>
+        <th class="text-left px-3 py-2">Ref</th>
+        <th class="text-left px-3 py-2">Status</th>
+        <th class="text-left px-3 py-2">Errors</th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100">
+      {% for r in report.row_results %}
+      <tr class="{% if r.status == 'error' %}bg-rose-50{% endif %}">
+        <td class="px-3 py-2 text-slate-600">{{ r.sheet }}</td>
+        <td class="px-3 py-2 font-mono">{{ r.row }}</td>
+        <td class="px-3 py-2 font-mono text-xs">{{ r.external_ref or "—" }}</td>
+        <td class="px-3 py-2">
+          {% if r.status == 'ok' %}
+            <span class="text-emerald-700">ok</span>
+          {% else %}
+            <span class="text-rose-700">error</span>
+          {% endif %}
+        </td>
+        <td class="px-3 py-2 text-rose-800 text-xs">{{ r.errors | join("; ") }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if report.valid_loan_rows > 0 %}
+  <div class="flex items-center gap-3 pt-2 border-t border-slate-200">
+    <button hx-post="/web/conversions/{{ report.batch_id }}/commit"
+            hx-target="#report"
+            hx-confirm="Commit {{ report.valid_loan_rows }} loan(s)? Per-loan transactions — invalid rows are skipped."
+            class="bg-emerald-700 text-white px-4 py-2 rounded font-medium hover:bg-emerald-800">
+      Commit {{ report.valid_loan_rows }} valid loan{% if report.valid_loan_rows != 1 %}s{% endif %}
+    </button>
+    <span class="htmx-indicator text-slate-500 text-sm">Dispatching…</span>
+    <span class="text-xs text-slate-500 ml-auto">batch_id: <span class="font-mono">{{ report.batch_id }}</span></span>
+  </div>
+  {% else %}
+  <div class="bg-rose-50 border border-rose-200 text-rose-800 rounded p-3 text-sm">
+    No valid rows to commit. Fix the issues in the source file and re-upload.
+  </div>
+  {% endif %}
+</div>
+{% endif %}

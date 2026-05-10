@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{% block title %}Board / Convert loan — LSP{% endblock %}
+{% block content %}
+<div class="max-w-4xl">
+  <h1 class="text-2xl font-semibold mb-1">Board / Convert loan</h1>
+  <p class="text-sm text-slate-500 mb-6">
+    Toggle <em>Convert from prior servicer</em> on if this loan is being transferred mid-life.
+    Otherwise, fill in the standard boarding fields and the loan will be originated fresh in this system.
+  </p>
+
+  <form hx-post="/web/loans" hx-target="#result" hx-swap="innerHTML"
+        class="bg-white border border-slate-200 rounded-lg shadow-sm p-6 space-y-6">
+
+    <!-- ===== Identity / parties ===== -->
+    <section>
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-600 mb-3">Identity</h2>
+      <div class="field-grid">
+        <div>
+          <label class="block text-sm font-medium mb-1">Portfolio</label>
+          <select name="portfolio_id" required class="w-full border border-slate-300 rounded px-2 py-1.5">
+            {% for p in portfolios %}<option value="{{ p.id }}">{{ p.code }} — {{ p.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Borrower</label>
+          <select name="primary_borrower_id" required class="w-full border border-slate-300 rounded px-2 py-1.5">
+            {% for b in borrowers %}<option value="{{ b.id }}">{{ b.legal_name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Loan number <span class="text-slate-400 font-normal">(optional, auto-assigned)</span></label>
+          <input type="text" name="loan_number" class="w-full border border-slate-300 rounded px-2 py-1.5" placeholder="e.g. LSP-000123">
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Loan name</label>
+          <input type="text" name="loan_name" class="w-full border border-slate-300 rounded px-2 py-1.5">
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Economics ===== -->
+    <section>
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-600 mb-3">Economics</h2>
+      <div class="field-grid">
+        <div>
+          <label class="block text-sm font-medium mb-1">Original balance ($)</label>
+          <input type="text" name="original_balance" required class="w-full border border-slate-300 rounded px-2 py-1.5" placeholder="1000000">
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Rate type</label>
+          <select name="rate_type" required class="w-full border border-slate-300 rounded px-2 py-1.5">
+            <option value="fixed">fixed</option>
+            <option value="floating">floating</option>
+            <option value="pik">pik</option>
+            <option value="zero_coupon">zero_coupon</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Coupon rate (% or decimal)</label>
+          <input type="text" name="coupon_rate" class="w-full border border-slate-300 rounded px-2 py-1.5" placeholder="8.5">
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Day count</label>
+          <select name="day_count" class="w-full border border-slate-300 rounded px-2 py-1.5">
+            <option>ACT/360</option><option>ACT/365</option><option>30/360</option><option>ACT/ACT</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Schedule ===== -->
+    <section>
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-600 mb-3">Schedule</h2>
+      <div class="field-grid">
+        <div>
+          <label class="block text-sm font-medium mb-1">Origination date</label>
+          <input type="date" name="origination_date" required class="w-full border border-slate-300 rounded px-2 py-1.5">
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Maturity date</label>
+          <input type="date" name="maturity_date" required class="w-full border border-slate-300 rounded px-2 py-1.5">
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Payment frequency</label>
+          <select name="payment_frequency" class="w-full border border-slate-300 rounded px-2 py-1.5">
+            <option>QUARTERLY</option><option>MONTHLY</option><option>SEMI_ANNUAL</option><option>ANNUAL</option><option>BULLET</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Amortization</label>
+          <select name="amortization_type" class="w-full border border-slate-300 rounded px-2 py-1.5">
+            <option>bullet</option><option>interest_only</option><option>amortizing</option><option>partial_amortizing</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Grace period (days)</label>
+          <input type="number" name="grace_period_days" min="0" max="30" value="5" class="w-full border border-slate-300 rounded px-2 py-1.5">
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Conversion toggle ===== -->
+    <section class="pt-2 border-t border-slate-200">
+      <label class="inline-flex items-center gap-2 cursor-pointer">
+        <input type="checkbox" name="conversion_enabled" value="on" id="conv-toggle"
+               onchange="document.getElementById('conv-fields').classList.toggle('hidden', !this.checked)"
+               class="w-4 h-4">
+        <span class="font-medium">Convert from prior servicer (mid-term boarding)</span>
+      </label>
+      <p class="text-sm text-slate-500 mt-1 ml-6">
+        Loan was originated elsewhere and is being transferred to this servicer at <em>as-of date</em>.
+        Opening balances replace day-1 zeros. Pre-cutover history stays on the prior servicer's books.
+      </p>
+
+      <div id="conv-fields" class="hidden mt-4 bg-amber-50 border border-amber-200 rounded p-4 space-y-4">
+        <div class="field-grid">
+          <div>
+            <label class="block text-sm font-medium mb-1">As-of date *</label>
+            <input type="date" name="as_of_date" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Current principal *</label>
+            <input type="text" name="current_principal" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white" placeholder="987654.32">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Accrued interest</label>
+            <input type="text" name="accrued_interest" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white" value="0">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Accrued fees</label>
+            <input type="text" name="accrued_fees" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white" value="0">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Last payment date</label>
+            <input type="date" name="last_payment_date" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Last payment amount</label>
+            <input type="text" name="last_payment_amount" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Next due date</label>
+            <input type="date" name="next_due_date" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white">
+          </div>
+        </div>
+        <div class="field-grid">
+          <div>
+            <label class="block text-sm font-medium mb-1">Paid-to-date principal</label>
+            <input type="text" name="paid_to_date_principal" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white" value="0">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Paid-to-date interest</label>
+            <input type="text" name="paid_to_date_interest" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white" value="0">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Paid-to-date fees</label>
+            <input type="text" name="paid_to_date_fees" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white" value="0">
+          </div>
+        </div>
+        <div class="field-grid">
+          <div>
+            <label class="block text-sm font-medium mb-1">Prior servicer name</label>
+            <input type="text" name="prior_servicer_name" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Prior servicer loan ID</label>
+            <input type="text" name="prior_servicer_loan_id" class="w-full border border-amber-300 rounded px-2 py-1.5 bg-white" placeholder="ACME-9001">
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Submit ===== -->
+    <div class="flex items-center gap-3 pt-2">
+      <button type="submit" class="bg-slate-900 text-white px-5 py-2 rounded font-medium hover:bg-slate-800">
+        Save loan
+      </button>
+      <span class="htmx-indicator text-slate-500 text-sm">Saving…</span>
+      <a href="/web/loans" class="text-slate-500 text-sm hover:underline">cancel</a>
+    </div>
+  </form>
+
+  <div id="result" class="mt-6"></div>
+</div>
+{% endblock %}

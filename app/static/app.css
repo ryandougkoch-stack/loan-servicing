@@ -1,0 +1,2 @@
+/* app/static/app.css — minimal supplementary styling on top of Tailwind CDN */
+.field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }

@@ -1,0 +1,21 @@
+{% if ok %}
+<div class="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded p-4">
+  <div class="font-semibold mb-1">
+    {% if converted %}Loan converted from prior servicer{% else %}Loan boarded{% endif %} ✓
+  </div>
+  <div class="text-sm">
+    <span class="font-mono">{{ loan.loan_number }}</span> — {{ loan.loan_name or "" }}
+    · current principal ${{ "{:,.2f}".format(loan.current_principal) }}
+    · status <span class="font-medium">{{ loan.status }}</span>
+  </div>
+  <div class="mt-3 flex gap-3 text-sm">
+    <a href="/web/loans" class="text-emerald-900 underline">back to loans</a>
+    <a href="/web/loans/new" class="text-emerald-900 underline">board another</a>
+  </div>
+</div>
+{% else %}
+<div class="bg-rose-50 border border-rose-200 text-rose-800 rounded p-4">
+  <div class="font-semibold mb-1">Could not save loan</div>
+  <div class="text-sm whitespace-pre-line">{{ error }}</div>
+</div>
+{% endif %}

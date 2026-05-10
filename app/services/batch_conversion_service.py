@@ -59,11 +59,14 @@ from uuid import UUID, uuid4
 
 import structlog
 from openpyxl import load_workbook
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, text as sa_text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+from contextlib import asynccontextmanager
 
+from app.core.config import settings
 from app.core.exceptions import ConflictError, ValidationError
-from app.db.session import get_tenant_session_context
+from app.db.session import get_tenant_session_context, _make_tenant_schema_name
 from app.models.conversion import ConversionBatch, LoanConversion
 from app.models.loan import Loan
 from app.models.portfolio import Counterparty, Portfolio
@@ -299,6 +302,11 @@ class BatchConversionService:
                         f"loan_number '{num}' duplicated in this batch (also row {seen_numbers[num]})"
                     )
                 seen_numbers[num] = ln.row
+
+            # Carry the full error list (parsing + cross-row validation) onto
+            # the parsed-loan object so the commit-phase spec captures it and
+            # the row gets correctly skipped at commit time.
+            ln.errors = row_errs
 
             if row_errs:
                 invalid_count += 1
@@ -548,18 +556,52 @@ async def commit_batch(tenant_slug: str, batch_id: UUID) -> dict[str, Any]:
     A failure on row 23 doesn't roll back rows 1..22. The caller (Celery task)
     is responsible for tenant routing.
 
+    Uses a NullPool engine bound to *this* asyncio.run's event loop — Celery
+    runs many short asyncio.run() invocations in the same prefork worker
+    process, and pooled asyncpg connections from a prior loop blow up with
+    "Future attached to a different loop" on reuse. NullPool means every
+    connection is fresh; we dispose at the end to drop the engine cleanly.
+
     Returns a summary dict that gets written to conversion_batch.commit_report.
     """
+    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool, future=True)
+    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)
+    schema = _make_tenant_schema_name(tenant_slug)
+    search_path = f"{schema}, shared, public"
+
+    @asynccontextmanager
+    async def task_session():
+        async with Session() as session:
+            try:
+                await session.execute(sa_text(f"SET LOCAL search_path TO {search_path}"))
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+
+    try:
+        return await _commit_batch_inner(tenant_slug, batch_id, task_session)
+    finally:
+        await engine.dispose()
+
+
+async def _commit_batch_inner(tenant_slug: str, batch_id: UUID, task_session) -> dict[str, Any]:
     # 1. Load batch + report in one session.
-    async with get_tenant_session_context(tenant_slug) as session:
+    async with task_session() as session:
         batch = (await session.execute(
             select(ConversionBatch).where(ConversionBatch.id == batch_id)
         )).scalar_one_or_none()
         if batch is None:
             raise ValidationError(f"conversion_batch {batch_id} not found")
-        if batch.status not in ("validated",):
+        # Accept both 'validated' (direct dispatch) and 'committing' (the
+        # web/api endpoint flips state to 'committing' before dispatching so
+        # concurrent commit attempts can be rejected at the gate).
+        if batch.status not in ("validated", "committing"):
             raise ValidationError(
-                f"batch {batch_id} status is {batch.status}, expected 'validated'"
+                f"batch {batch_id} status is {batch.status}, expected 'validated' or 'committing'"
             )
         report = batch.validation_report or {}
         resolution = report.get("_resolution", {})
@@ -572,7 +614,7 @@ async def commit_batch(tenant_slug: str, batch_id: UUID) -> dict[str, Any]:
 
     # 2. Insert any new counterparties — single transaction is fine because
     #    they're side-effect-free (no GL impact).
-    async with get_tenant_session_context(tenant_slug) as session:
+    async with task_session() as session:
         for cp in cp_creates:
             existing = (await session.execute(
                 select(Counterparty).where(Counterparty.id == UUID(cp["id"]))
@@ -606,7 +648,7 @@ async def commit_batch(tenant_slug: str, batch_id: UUID) -> dict[str, Any]:
         if spec.get("errors") or not spec.get("payload"):
             continue   # invalid rows already counted at validate time
         try:
-            await _commit_one_loan(tenant_slug, spec, batch_id, port_map, cp_map)
+            await _commit_one_loan(task_session, spec, batch_id, port_map, cp_map)
             succeeded.append({"row": spec["row"], "external_ref": spec.get("external_ref")})
         except Exception as e:
             logger.exception("batch_loan_commit_failed", row=spec["row"], err=str(e))
@@ -614,13 +656,18 @@ async def commit_batch(tenant_slug: str, batch_id: UUID) -> dict[str, Any]:
                            "error": str(e)})
 
     # 4. Write final summary back to the batch row.
-    async with get_tenant_session_context(tenant_slug) as session:
+    async with task_session() as session:
         batch = (await session.execute(
             select(ConversionBatch).where(ConversionBatch.id == batch_id)
         )).scalar_one()
         batch.commit_report = {"succeeded": succeeded, "failed": failed}
         batch.succeeded_rows = len(succeeded)
-        batch.failed_rows = (report.get("invalid_loan_rows", 0) or 0) + len(failed)
+        # invalid-at-validate rows + commit-time failures = total non-success.
+        # Capped at total_rows to satisfy ck_conversion_batch_row_counts even if
+        # a row got double-counted due to a logic regression upstream.
+        validate_invalid = report.get("invalid_loan_rows", 0) or 0
+        batch.failed_rows = min(batch.total_rows - len(succeeded),
+                                validate_invalid + len(failed))
         batch.status = "completed"  # partial success is still completion; failed_rows surfaces detail
         await session.flush()
 
@@ -628,14 +675,14 @@ async def commit_batch(tenant_slug: str, batch_id: UUID) -> dict[str, Any]:
 
 
 async def _commit_one_loan(
-    tenant_slug: str,
+    task_session,
     spec: dict[str, Any],
     batch_id: UUID,
     port_map: dict[str, UUID],
     cp_map: dict[str, UUID],
 ) -> None:
     """Commit one loan in its own transaction. Raises on failure (caller logs)."""
-    async with get_tenant_session_context(tenant_slug) as session:
+    async with task_session() as session:
         payload_dict = dict(spec["payload"])
         payload_dict["portfolio_id"] = str(port_map[spec["portfolio_code"]])
         payload_dict["primary_borrower_id"] = str(cp_map[spec["borrower_external_ref"]])

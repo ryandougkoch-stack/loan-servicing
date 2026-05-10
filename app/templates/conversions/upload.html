@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Batch convert — LSP{% endblock %}
+{% block content %}
+<div class="max-w-5xl">
+  <h1 class="text-2xl font-semibold mb-1">Batch loan conversion</h1>
+  <p class="text-sm text-slate-500 mb-6">
+    Upload a multi-sheet xlsx — <strong>Counterparties</strong> + <strong>Loans</strong> sheets.
+    The file is parsed and validated; nothing is committed until you confirm.
+    Per-loan transactions: a single bad row doesn't block the rest.
+  </p>
+
+  <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-6 mb-8">
+    <h2 class="font-semibold mb-3">1. Upload</h2>
+    <form hx-post="/web/conversions/validate" hx-target="#report"
+          hx-encoding="multipart/form-data" class="flex items-center gap-3">
+      <input type="file" name="file" accept=".xlsx" required
+             class="text-sm border border-slate-300 rounded px-3 py-2 bg-white">
+      <button type="submit" class="bg-slate-900 text-white px-4 py-2 rounded font-medium hover:bg-slate-800">
+        Validate
+      </button>
+      <span class="htmx-indicator text-slate-500 text-sm">Parsing…</span>
+    </form>
+  </div>
+
+  <div id="report"></div>
+
+  <div class="mt-10 bg-white border border-slate-200 rounded-lg shadow-sm p-6">
+    <h2 class="font-semibold mb-3">Recent batches</h2>
+    <table class="w-full text-sm">
+      <thead class="text-slate-600 text-xs uppercase tracking-wide">
+        <tr>
+          <th class="text-left py-2">Uploaded</th>
+          <th class="text-left py-2">File</th>
+          <th class="text-left py-2">Status</th>
+          <th class="text-right py-2">Rows</th>
+          <th class="text-right py-2">Succeeded</th>
+          <th class="text-right py-2">Failed</th>
+          <th class="text-left py-2"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-100">
+        {% for b in batches %}
+        <tr>
+          <td class="py-2 text-slate-500">{{ b.uploaded_at.strftime("%Y-%m-%d %H:%M") }}</td>
+          <td class="py-2 font-mono text-xs">{{ b.file_name }}</td>
+          <td class="py-2">
+            <span class="inline-block text-xs px-2 py-0.5 rounded
+              {% if b.status == 'completed' %}bg-emerald-100 text-emerald-800
+              {% elif b.status == 'failed' %}bg-rose-100 text-rose-800
+              {% elif b.status == 'committing' %}bg-blue-100 text-blue-800
+              {% else %}bg-slate-100 text-slate-700{% endif %}">{{ b.status }}</span>
+          </td>
+          <td class="py-2 text-right tabular-nums">{{ b.total_rows }}</td>
+          <td class="py-2 text-right tabular-nums text-emerald-700">{{ b.succeeded_rows }}</td>
+          <td class="py-2 text-right tabular-nums text-rose-700">{{ b.failed_rows }}</td>
+          <td class="py-2">
+            <button hx-get="/web/conversions/{{ b.id }}/status" hx-target="#report"
+                    class="text-xs text-blue-700 hover:underline">view</button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="py-6 text-center text-slate-500">No batches yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

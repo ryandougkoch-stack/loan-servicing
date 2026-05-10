@@ -1,0 +1,67 @@
+{% if error %}
+<div class="bg-rose-50 border border-rose-200 text-rose-800 rounded p-4">
+  <div class="font-semibold mb-1">Conflict</div>
+  <div class="text-sm">{{ error }}</div>
+</div>
+{% else %}
+<div class="bg-white border border-slate-200 rounded-lg shadow-sm p-6"
+     {% if polling %}hx-get="/web/conversions/{{ batch.id }}/status" hx-target="this" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  <h2 class="font-semibold mb-3">3. Commit status</h2>
+
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm mb-4">
+    <div class="bg-slate-50 rounded p-3">
+      <div class="text-xs uppercase text-slate-500">Status</div>
+      <div class="text-lg font-semibold
+        {% if batch.status == 'completed' %}text-emerald-800
+        {% elif batch.status == 'failed' %}text-rose-800
+        {% elif batch.status == 'committing' %}text-blue-800
+        {% endif %}">{{ batch.status }}{% if polling %} <span class="text-xs animate-pulse">…</span>{% endif %}</div>
+    </div>
+    <div class="bg-slate-50 rounded p-3">
+      <div class="text-xs uppercase text-slate-500">Total rows</div>
+      <div class="text-lg font-semibold tabular-nums">{{ batch.total_rows }}</div>
+    </div>
+    <div class="bg-emerald-50 rounded p-3">
+      <div class="text-xs uppercase text-emerald-700">Succeeded</div>
+      <div class="text-lg font-semibold tabular-nums text-emerald-800">{{ batch.succeeded_rows }}</div>
+    </div>
+    <div class="bg-rose-50 rounded p-3">
+      <div class="text-xs uppercase text-rose-700">Failed</div>
+      <div class="text-lg font-semibold tabular-nums text-rose-800">{{ batch.failed_rows }}</div>
+    </div>
+  </div>
+
+  {% if batch.commit_report and batch.commit_report.get("succeeded") %}
+  <details class="mb-3">
+    <summary class="cursor-pointer text-sm text-emerald-700 font-medium">
+      Show {{ batch.commit_report["succeeded"] | length }} succeeded row(s)
+    </summary>
+    <ul class="mt-2 text-xs space-y-1 ml-4 list-disc">
+      {% for r in batch.commit_report["succeeded"] %}
+      <li>row {{ r.row }} <span class="font-mono">{{ r.external_ref or "" }}</span></li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% endif %}
+
+  {% if batch.commit_report and batch.commit_report.get("failed") %}
+  <details open class="mb-3">
+    <summary class="cursor-pointer text-sm text-rose-700 font-medium">
+      Show {{ batch.commit_report["failed"] | length }} failed row(s)
+    </summary>
+    <ul class="mt-2 text-xs space-y-1 ml-4 list-disc">
+      {% for r in batch.commit_report["failed"] %}
+      <li>row {{ r.row }} <span class="font-mono">{{ r.external_ref or "" }}</span> — <span class="text-rose-800">{{ r.error }}</span></li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% endif %}
+
+  {% if not polling %}
+  <div class="flex gap-3 pt-3 border-t border-slate-200">
+    <a href="/web/loans" class="text-sm text-blue-700 hover:underline">go to loans list</a>
+    <a href="/web/conversions" class="text-sm text-blue-700 hover:underline">upload another batch</a>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
