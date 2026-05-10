@@ -1,6 +1,6 @@
 """app/api/v1/router.py"""
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, loans, payments, reports, counterparties, document_parsing, clients, portfolios, allocations
+from app.api.v1.endpoints import auth, loans, payments, reports, counterparties, document_parsing, clients, portfolios, allocations, conversions
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
@@ -12,3 +12,4 @@ api_router.include_router(document_parsing.router)
 api_router.include_router(clients.router)
 api_router.include_router(portfolios.router)
 api_router.include_router(allocations.router)
+api_router.include_router(conversions.router)

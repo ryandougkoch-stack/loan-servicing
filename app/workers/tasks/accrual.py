@@ -14,11 +14,11 @@ This task is idempotent: if it runs twice for the same date it will
 detect the existing accrual_date record and skip.
 """
 import asyncio
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 import structlog
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 
 from app.db.session import get_tenant_session_context
 from app.models.ledger import InterestAccrual, JournalEntry, JournalLine, LedgerAccount
@@ -117,17 +117,39 @@ async def _run_accrual(tenant_slug: str, accrual_date: date) -> None:
         port_result = await session.execute(select(Portfolio.id, Portfolio.code))
         portfolio_codes = {row.id: row.code for row in port_result}
 
+        # Pre-fetch each loan's most recent accrual_date so we can backfill
+        # missing days in one pass. Without this, a loan converted with
+        # as_of_date in the past silently skips the gap days; the worker only
+        # ever wrote one row per nightly run.
+        last_accrual_result = await session.execute(
+            select(
+                InterestAccrual.loan_id,
+                func.max(InterestAccrual.accrual_date).label("max_date"),
+            )
+            .where(InterestAccrual.is_reversed == False)
+            .group_by(InterestAccrual.loan_id)
+        )
+        last_accrual_map = {row.loan_id: row.max_date for row in last_accrual_result}
+
         skipped = 0
         processed = 0
+        backfilled = 0
         errors = 0
 
         for loan in loans:
             try:
-                accrued = await _accrue_loan(session, loan, accrual_date, accounts, portfolio_codes)
-                if accrued:
-                    processed += 1
-                else:
+                missing_dates = _missing_accrual_dates(
+                    loan, accrual_date, last_accrual_map.get(loan.id)
+                )
+                if not missing_dates:
                     skipped += 1
+                    continue
+                for d in missing_dates:
+                    accrued = await _accrue_loan(session, loan, d, accounts, portfolio_codes)
+                    if accrued:
+                        processed += 1
+                        if d != accrual_date:
+                            backfilled += 1
             except Exception as e:
                 logger.error(
                     "loan_accrual_failed",
@@ -142,9 +164,38 @@ async def _run_accrual(tenant_slug: str, accrual_date: date) -> None:
             tenant=tenant_slug,
             date=accrual_date.isoformat(),
             processed=processed,
+            backfilled=backfilled,
             skipped=skipped,
             errors=errors,
         )
+
+
+def _missing_accrual_dates(loan, accrual_date: date, last_accrual: date | None) -> list[date]:
+    """
+    Return the list of dates between the loan's accrual start and accrual_date
+    (inclusive) that have no posted accrual yet.
+
+    Start date is:
+      - day after last_accrual (if any prior accruals exist for this loan)
+      - else accrual_start_date for converted loans
+      - else funded_at for originated loans
+      - else None → no backfill (loan not yet eligible)
+
+    Returns an ordered list of date objects. Empty if the loan is up-to-date.
+    PIK loans must be processed in order: each day's accrual capitalises into
+    the next day's principal, so the returned list MUST stay sorted ascending.
+    """
+    if last_accrual is not None:
+        start = last_accrual + timedelta(days=1)
+    elif loan.accrual_start_date is not None:
+        start = loan.accrual_start_date
+    elif loan.funded_at is not None:
+        start = loan.funded_at
+    else:
+        return []
+    if start > accrual_date:
+        return []
+    return [start + timedelta(days=i) for i in range((accrual_date - start).days + 1)]
 
 
 async def _accrue_loan(
